@@ -3,6 +3,7 @@
 use core::{
 	cell::RefCell,
 	ffi::CStr,
+	fmt,
 	future::Future,
 	hash::{Hash, Hasher},
 	mem::MaybeUninit,
@@ -23,15 +24,16 @@ use rustix::{
 };
 use uring_async::{block_on, ops::Statx, Uring};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FileInfo {
 	ino: u64,
-	path: CString,
+	hash: u64,
+	path: MegaName,
 }
 
 impl PartialEq for FileInfo {
 	fn eq(&self, other: &Self) -> bool {
-		self.ino == other.ino
+		self.cmp(other).is_eq()
 	}
 }
 
@@ -45,12 +47,13 @@ impl PartialOrd for FileInfo {
 
 impl Ord for FileInfo {
 	fn cmp(&self, other: &Self) -> Ordering {
-		self.ino.cmp(&other.ino)
+		let self_num = ((self.hash as u128) << 64) + self.ino as u128;
+		let other_num = ((other.hash as u128) << 64) + other.ino as u128;
+		self_num.cmp(&other_num)
 	}
 }
 
 fn is_all_same_inode(files: &[FileInfo]) -> bool {
-	assert!(!files.is_empty());
 	let last_ino = files[0].ino;
 	for file in files.iter().skip(1) {
 		if file.ino != last_ino {
@@ -93,22 +96,58 @@ fn main() {
 		recurse_dir(&ring, dir, &path, &mut map);
 	}
 
-	let groups: RefCell<Vec<FileGroup>> = RefCell::new(
-		map.drain()
-			.filter_map(|(k, mut v)| {
-				if v.len() <= 1 || is_all_same_inode(&v) {
-					None
-				} else {
-					// Sort so same inode files are together.
-					v.sort_unstable();
-					v.shrink_to_fit();
-					Some(FileGroup { info: k, files: v })
-				}
-			})
-			.collect(),
-	);
+	let groups: Vec<FileGroup> = map
+		.into_iter()
+		.filter_map(|(k, mut v)| {
+			if v.len() <= 1 || is_all_same_inode(&v) {
+				None
+			} else {
+				// Sort so same inode files are together.
+				v.sort_unstable();
 
-	println!("{:#?}", groups);
+				// Compress multiple names into a single `MegaName`.
+				let new_files: Vec<FileInfo> = v
+					.chunk_by_mut(FileInfo::eq)
+					.map(|infos| FileInfo {
+						ino: infos[0].ino,
+						hash: infos[0].hash,
+						path: infos.iter().map(|x| x.path.first_name()).into(),
+					})
+					.collect();
+
+				Some(FileGroup {
+					info: k,
+					files: new_files,
+				})
+			}
+		})
+		.collect();
+
+	//println!("{:?}", groups);
+
+	let mut new_groups: Vec<FileGroup> = Default::default();
+
+	for mut group in groups {
+		// Hash files
+		for file in group.files.iter_mut() {
+			println!("Reading {:?}", file.path.first_name());
+			file.hash = 0;
+		}
+
+		group.files.sort_unstable();
+
+		for chunk in group.files.chunk_by(|a, b| a.hash == b.hash) {
+			if chunk.len() <= 1 {
+				continue;
+			}
+			new_groups.push(FileGroup {
+				info: group.info,
+				files: chunk.to_owned(),
+			});
+		}
+	}
+
+	println!("{:#?}", new_groups);
 }
 
 fn recurse_dir(
@@ -179,7 +218,8 @@ fn recurse_dir(
 		let full_path = unsafe { CString::from_vec_with_nul_unchecked(path_buf.clone()) };
 		let file_info = FileInfo {
 			ino: statx.stx_ino,
-			path: full_path,
+			path: MegaName::from_cstring(full_path),
+			hash: 0,
 		};
 
 		map.entry(group_info).or_default().push(file_info);
@@ -242,6 +282,53 @@ impl<'a, F: Future> Future for SliceJoin<'a, F> {
 			Poll::Ready(())
 		} else {
 			Poll::Pending
+		}
+	}
+}
+
+#[derive(Clone)]
+struct MegaName(Box<[u8]>);
+
+impl<'a> MegaName {
+	fn from_cstring(cstring: CString) -> Self {
+		Self(cstring.into_bytes().into())
+	}
+
+	fn first_name(&self) -> &CStr {
+		unsafe { CStr::from_ptr(self.0.as_ptr().cast()) }
+	}
+
+	fn iter(&'a self) -> MegaNameIter<'a> {
+		MegaNameIter(&self.0)
+	}
+}
+
+impl<'a, T: Iterator<Item = &'a CStr>> From<T> for MegaName {
+	fn from(value: T) -> Self {
+		Self(value.flat_map(CStr::to_bytes_with_nul).copied().collect())
+	}
+}
+
+impl fmt::Debug for MegaName {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_list().entries(self.iter()).finish()
+	}
+}
+
+#[derive(Debug)]
+struct MegaNameIter<'a>(&'a [u8]);
+
+impl<'a> Iterator for MegaNameIter<'a> {
+	type Item = &'a CStr;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.0.is_empty() {
+			None
+		} else {
+			let ret = unsafe { CStr::from_ptr(self.0.as_ptr().cast()) };
+			let next_index = self.0.iter().position(|x| *x == 0).unwrap() + 1;
+			self.0 = &self.0[next_index..];
+			Some(ret)
 		}
 	}
 }
