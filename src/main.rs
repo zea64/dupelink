@@ -9,6 +9,7 @@ use core::{
 	pin::Pin,
 };
 use std::{
+	cmp::Ordering,
 	collections::HashMap,
 	ffi::CString,
 	os::unix::ffi::OsStringExt,
@@ -34,6 +35,31 @@ impl PartialEq for FileInfo {
 	}
 }
 
+impl Eq for FileInfo {}
+
+impl PartialOrd for FileInfo {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for FileInfo {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.ino.cmp(&other.ino)
+	}
+}
+
+fn is_all_same_inode(files: &[FileInfo]) -> bool {
+	assert!(!files.is_empty());
+	let last_ino = files[0].ino;
+	for file in files.iter().skip(1) {
+		if file.ino != last_ino {
+			return false;
+		}
+	}
+	true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GroupInfo {
 	size: u64,
@@ -45,26 +71,6 @@ struct FileGroup {
 	info: GroupInfo,
 	files: Vec<FileInfo>,
 }
-
-impl FileGroup {
-	fn add(&mut self, file: FileInfo) {
-		self.files.push(file);
-	}
-}
-
-impl Hash for FileGroup {
-	fn hash<H: Hasher>(&self, state: &mut H) {
-		self.info.hash(state);
-	}
-}
-
-impl PartialEq for FileGroup {
-	fn eq(&self, other: &Self) -> bool {
-		self.info == other.info
-	}
-}
-
-impl Eq for FileGroup {}
 
 fn main() {
 	let ring = RefCell::new(Uring::new().unwrap());
@@ -87,7 +93,22 @@ fn main() {
 		recurse_dir(&ring, dir, &path, &mut map);
 	}
 
-	println!("{:#?}", map);
+	let groups: RefCell<Vec<FileGroup>> = RefCell::new(
+		map.drain()
+			.filter_map(|(k, mut v)| {
+				if v.len() <= 1 || is_all_same_inode(&v) {
+					None
+				} else {
+					// Sort so same inode files are together.
+					v.sort_unstable();
+					v.shrink_to_fit();
+					Some(FileGroup { info: k, files: v })
+				}
+			})
+			.collect(),
+	);
+
+	println!("{:#?}", groups);
 }
 
 fn recurse_dir(
