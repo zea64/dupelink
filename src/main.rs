@@ -53,16 +53,6 @@ impl Ord for FileInfo {
 	}
 }
 
-fn is_all_same_inode(files: &[FileInfo]) -> bool {
-	let last_ino = files[0].ino;
-	for file in files.iter().skip(1) {
-		if file.ino != last_ino {
-			return false;
-		}
-	}
-	true
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GroupInfo {
 	size: u64,
@@ -99,7 +89,7 @@ fn main() {
 	let groups: Vec<FileGroup> = map
 		.into_iter()
 		.filter_map(|(k, mut v)| {
-			if v.len() <= 1 || is_all_same_inode(&v) {
+			if v.chunk_by(FileInfo::eq).count() == 1 {
 				None
 			} else {
 				// Sort so same inode files are together.
