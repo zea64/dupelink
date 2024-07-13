@@ -1,11 +1,12 @@
-#![feature(hash_set_entry)]
+#![feature(new_uninit)]
 
 use core::{
 	cell::RefCell,
 	ffi::CStr,
-	fmt,
+	fmt::{self, Write},
 	future::Future,
 	hash::{Hash, Hasher},
+	iter::Fuse,
 	mem::MaybeUninit,
 	pin::Pin,
 };
@@ -19,10 +20,16 @@ use std::{
 
 use rustix::{
 	fd::{AsFd, BorrowedFd, OwnedFd},
-	fs::{openat2, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD},
-	io_uring::IoringSqeFlags,
+	fs::{openat2, Advice, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD},
+	io::Errno,
+	io_uring::{open_how, IoringSqeFlags},
 };
-use uring_async::{block_on, ops::Statx, Uring};
+use uring_async::{
+	block_on,
+	ops::{Close, Fadvise, Openat2, Read, Statx},
+	Semaphore,
+	Uring,
+};
 
 #[derive(Debug, Clone)]
 struct FileInfo {
@@ -66,7 +73,8 @@ struct FileGroup {
 }
 
 fn main() {
-	let ring = RefCell::new(Uring::new().unwrap());
+	let owned_ring = RefCell::new(Uring::new().unwrap());
+	let ring = &owned_ring;
 	let mut map = HashMap::new();
 
 	for path in std::env::args_os().skip(1) {
@@ -83,7 +91,7 @@ fn main() {
 		)
 		.unwrap();
 
-		recurse_dir(&ring, dir, &path, &mut map);
+		recurse_dir(ring, dir, &path, &mut map);
 	}
 
 	let groups: Vec<FileGroup> = map
@@ -113,31 +121,34 @@ fn main() {
 		})
 		.collect();
 
-	//println!("{:?}", groups);
+	let owned_new_groups: RefCell<Vec<FileGroup>> = Default::default();
+	let new_groups = &owned_new_groups;
 
-	let mut new_groups: Vec<FileGroup> = Default::default();
+	let fd_semaphore = Semaphore::new(4096);
 
-	for mut group in groups {
-		// Hash files
-		for file in group.files.iter_mut() {
-			println!("Reading {:?}", file.path.first_name());
-			file.hash = 0;
-		}
+	block_on(
+		ring,
+		IteratorJoin::<4096, _, _>::new(
+			groups
+				.into_iter()
+				.map(|group| hash_group(ring, group, new_groups, &fd_semaphore)),
+		),
+	);
 
-		group.files.sort_unstable();
+	let mut buffer = String::new();
+	for group in owned_new_groups.into_inner() {
+		buffer.clear();
 
-		for chunk in group.files.chunk_by(|a, b| a.hash == b.hash) {
-			if chunk.len() <= 1 {
-				continue;
+		writeln!(&mut buffer, "({}) ", group.info.size).unwrap();
+
+		for file in group.files {
+			for name in file.path.iter() {
+				writeln!(&mut buffer, "{:?}", name).unwrap();
 			}
-			new_groups.push(FileGroup {
-				info: group.info,
-				files: chunk.to_owned(),
-			});
 		}
-	}
 
-	println!("{:#?}", new_groups);
+		print!("{}", buffer);
+	}
 }
 
 fn recurse_dir(
@@ -184,7 +195,7 @@ fn recurse_dir(
 
 	dirs.shrink_to_fit();
 
-	block_on(ring, SliceJoin { slice: &mut files });
+	block_on(ring, SliceJoin(&mut files));
 
 	let mut path_buf = Vec::new();
 	for output in files {
@@ -205,7 +216,7 @@ fn recurse_dir(
 		};
 
 		path_concat(&mut path_buf, dir_path, &file_path);
-		let full_path = unsafe { CString::from_vec_with_nul_unchecked(path_buf.clone()) };
+		let full_path = CString::from_vec_with_nul(path_buf.clone()).unwrap();
 		let file_info = FileInfo {
 			ino: statx.stx_ino,
 			path: MegaName::from_cstring(full_path),
@@ -238,14 +249,109 @@ fn recurse_dir(
 	}
 }
 
+async fn hash_group(
+	ring: &RefCell<Uring>,
+	mut group: FileGroup,
+	new_groups: &RefCell<Vec<FileGroup>>,
+	fd_semaphore: &Semaphore,
+) {
+	let mut files: Vec<_> = group
+		.files
+		.iter_mut()
+		.map(|file| {
+			FutureOrOutput::Future(async move {
+				let _guard = fd_semaphore.wait().await;
+
+				let open_how = open_how {
+					flags: (OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC)
+						.bits()
+						.into(),
+					mode: 0,
+					resolve: ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+				};
+
+				let fd = Openat2::new(
+					ring,
+					CWD,
+					file.path.first_name(),
+					&open_how,
+					IoringSqeFlags::empty(),
+				)
+				.await
+				.unwrap_or_else(|e| panic!("{:?}: {:?}", e, file.path));
+
+				let _ = Fadvise::new(
+					ring,
+					fd.as_fd(),
+					0,
+					0,
+					Advice::WillNeed,
+					IoringSqeFlags::empty(),
+				)
+				.await;
+
+				let mut hash = std::hash::DefaultHasher::new();
+				let mut total_read = 0;
+				loop {
+					let mut buffer = Box::new_uninit_slice(core::cmp::min(
+						group.info.size.try_into().unwrap(),
+						2 * 1024 * 1024,
+					));
+
+					match Read::new(ring, fd.as_fd(), &mut buffer, IoringSqeFlags::empty()).await {
+						Ok([]) => {
+							assert_eq!(total_read, group.info.size);
+							break;
+						}
+						Ok(x) => {
+							total_read += <usize as TryInto<u64>>::try_into(x.len()).unwrap();
+							assert!(total_read <= group.info.size);
+							hash.write(x);
+						}
+						Err(Errno::AGAIN | Errno::INTR | Errno::CANCELED) => (),
+						Err(x) => panic!("{:?}", x),
+					}
+				}
+
+				let _ = Fadvise::new(
+					ring,
+					fd.as_fd(),
+					0,
+					0,
+					Advice::DontNeed,
+					IoringSqeFlags::empty(),
+				)
+				.await;
+
+				let _ = Close::new(ring, fd).await;
+
+				file.hash = hash.finish();
+			})
+		})
+		.collect();
+
+	SliceJoin(&mut files).await;
+	drop(files);
+
+	group.files.sort_unstable();
+
+	for chunk in group.files.chunk_by(|a, b| a.hash == b.hash) {
+		if chunk.len() <= 1 {
+			continue;
+		}
+		new_groups.borrow_mut().push(FileGroup {
+			info: group.info,
+			files: chunk.to_owned(),
+		});
+	}
+}
+
 enum FutureOrOutput<F, O> {
 	Future(F),
 	Output(O),
 }
 
-struct SliceJoin<'a, F: Future> {
-	slice: &'a mut [FutureOrOutput<F, <F as Future>::Output>],
-}
+struct SliceJoin<'a, F: Future>(&'a mut [FutureOrOutput<F, <F as Future>::Output>]);
 
 impl<'a, F: Future> Future for SliceJoin<'a, F> {
 	type Output = ();
@@ -253,7 +359,7 @@ impl<'a, F: Future> Future for SliceJoin<'a, F> {
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
 		let mut output_count = 0;
-		for fut_or_output in this.slice.iter_mut() {
+		for fut_or_output in this.0.iter_mut() {
 			match fut_or_output {
 				FutureOrOutput::Output(_) => {
 					output_count += 1;
@@ -268,10 +374,58 @@ impl<'a, F: Future> Future for SliceJoin<'a, F> {
 			}
 		}
 
-		if output_count == this.slice.len() {
+		if output_count == this.0.len() {
 			Poll::Ready(())
 		} else {
 			Poll::Pending
+		}
+	}
+}
+
+struct IteratorJoin<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> {
+	buffer: [Option<F>; N],
+	iter: Fuse<I>,
+}
+
+impl<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> IteratorJoin<N, F, I> {
+	fn new(iter: I) -> Self {
+		Self {
+			buffer: [const { None }; N],
+			iter: iter.fuse(),
+		}
+	}
+}
+
+impl<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> Future
+	for IteratorJoin<N, F, I>
+{
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = unsafe { Pin::into_inner_unchecked(self) };
+
+		let mut any_pending = false;
+		for slot in this.buffer.iter_mut() {
+			loop {
+				if let Some(f) = slot {
+					if Future::poll(unsafe { Pin::new_unchecked(f) }, cx).is_ready() {
+						*slot = None;
+					} else {
+						any_pending = true;
+						break;
+					}
+				} else if let Some(f) = this.iter.next() {
+					*slot = Some(f);
+				} else {
+					break;
+				}
+			}
+		}
+
+		if any_pending {
+			Poll::Pending
+		} else {
+			Poll::Ready(())
 		}
 	}
 }
@@ -281,7 +435,7 @@ struct MegaName(Box<[u8]>);
 
 impl<'a> MegaName {
 	fn from_cstring(cstring: CString) -> Self {
-		Self(cstring.into_bytes().into())
+		Self(cstring.into_bytes_with_nul().into())
 	}
 
 	fn first_name(&self) -> &CStr {
@@ -330,5 +484,5 @@ fn path_concat<'a, 'b>(path_buf: &'a mut Vec<u8>, str1: &'b CStr, str2: &'b CStr
 	path_buf.extend_from_slice(str2.to_bytes());
 	path_buf.push(0);
 
-	unsafe { CStr::from_bytes_with_nul_unchecked(path_buf) }
+	CStr::from_bytes_with_nul(path_buf).unwrap()
 }
