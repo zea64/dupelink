@@ -134,9 +134,18 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 	Ok(args)
 }
 
+#[derive(Debug)]
+struct Globals {
+	ring: RefCell<Uring>,
+	minsize: u64,
+	maxsize: u64,
+	dir_oflags: OFlags,
+	dir_open_how: open_how,
+	file_open_how: open_how,
+}
+
 fn main() {
-	let owned_ring = RefCell::new(Uring::new().unwrap());
-	let ring = &owned_ring;
+	let ring = RefCell::new(Uring::new().unwrap());
 	let mut map = HashMap::new();
 
 	let args = match parse_args() {
@@ -147,17 +156,44 @@ fn main() {
 		}
 	};
 
+	let file_oflags = OFlags::RDONLY
+		| OFlags::NOCTTY
+		| OFlags::CLOEXEC
+		| OFlags::NOFOLLOW
+		| if args.noatime {
+			OFlags::NOATIME
+		} else {
+			OFlags::empty()
+		};
+	let dir_oflags = file_oflags | OFlags::DIRECTORY;
+	let globals = Globals {
+		ring,
+		minsize: args.minsize,
+		maxsize: args.maxsize,
+		dir_oflags,
+		dir_open_how: open_how {
+			flags: dir_oflags.bits().into(),
+			mode: 0,
+			resolve: ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS | ResolveFlags::BENEATH,
+		},
+		file_open_how: open_how {
+			flags: file_oflags.bits().into(),
+			mode: 0,
+			resolve: ResolveFlags::NO_MAGICLINKS,
+		},
+	};
+
 	for path in args.paths.iter() {
 		let dir = openat2(
 			CWD,
 			path,
-			OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOCTTY | OFlags::CLOEXEC,
+			globals.dir_oflags,
 			Mode::empty(),
 			ResolveFlags::empty(),
 		)
 		.unwrap();
 
-		recurse_dir(ring, dir, path, &mut map);
+		recurse_dir(&globals, dir, path, &mut map);
 	}
 
 	let groups: Vec<FileGroup> = map
@@ -193,11 +229,11 @@ fn main() {
 	let fd_semaphore = Semaphore::new(4096);
 
 	block_on(
-		ring,
+		&globals.ring,
 		IteratorJoin::<4096, _, _>::new(
 			groups
 				.into_iter()
-				.map(|group| hash_group(ring, group, new_groups, &fd_semaphore)),
+				.map(|group| hash_group(&globals, group, new_groups, &fd_semaphore)),
 		),
 	);
 
@@ -218,7 +254,7 @@ fn main() {
 }
 
 fn recurse_dir(
-	ring: &RefCell<Uring>,
+	globals: &Globals,
 	dirfd: OwnedFd,
 	dir_path: &CStr,
 	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
@@ -238,7 +274,7 @@ fn recurse_dir(
 				files.push(FutureOrOutput::Future(async move {
 					let mut statx_buf = MaybeUninit::uninit();
 					let statx = Statx::new(
-						ring,
+						&globals.ring,
 						dirfd_borrow,
 						&file_name,
 						AtFlags::empty(),
@@ -264,7 +300,7 @@ fn recurse_dir(
 
 	dirs.shrink_to_fit();
 
-	block_on(ring, SliceJoin(&mut files));
+	block_on(&globals.ring, SliceJoin(&mut files));
 
 	let mut path_buf = Vec::new();
 	for output in files {
@@ -272,6 +308,10 @@ fn recurse_dir(
 			FutureOrOutput::Output((x, path)) => (x.unwrap(), path),
 			_ => unreachable!(),
 		};
+
+		if statx.stx_size < globals.minsize || statx.stx_size > globals.maxsize {
+			continue;
+		}
 
 		let mut hasher = std::hash::DefaultHasher::new();
 		hasher.write_u16(statx.stx_mode);
@@ -301,16 +341,13 @@ fn recurse_dir(
 		let new_dirfd = openat2(
 			dirfd.as_fd(),
 			&new_dir_path,
-			OFlags::RDONLY
-				| OFlags::DIRECTORY
-				| OFlags::NOFOLLOW
-				| OFlags::NOCTTY | OFlags::CLOEXEC,
+			globals.dir_oflags,
 			Mode::empty(),
-			ResolveFlags::NO_XDEV | ResolveFlags::BENEATH,
+			globals.dir_open_how.resolve,
 		)
 		.unwrap();
 		recurse_dir(
-			ring,
+			globals,
 			new_dirfd,
 			path_concat(&mut path_buf, dir_path, &new_dir_path),
 			map,
@@ -319,7 +356,7 @@ fn recurse_dir(
 }
 
 async fn hash_group(
-	ring: &RefCell<Uring>,
+	globals: &Globals,
 	mut group: FileGroup,
 	new_groups: &RefCell<Vec<FileGroup>>,
 	fd_semaphore: &Semaphore,
@@ -331,26 +368,18 @@ async fn hash_group(
 			FutureOrOutput::Future(async move {
 				let _guard = fd_semaphore.wait().await;
 
-				let open_how = open_how {
-					flags: (OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC)
-						.bits()
-						.into(),
-					mode: 0,
-					resolve: ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
-				};
-
 				let fd = Openat2::new(
-					ring,
+					&globals.ring,
 					CWD,
 					file.path.first_name(),
-					&open_how,
+					&globals.file_open_how,
 					IoringSqeFlags::empty(),
 				)
 				.await
 				.unwrap_or_else(|e| panic!("{:?}: {:?}", e, file.path));
 
 				let _ = Fadvise::new(
-					ring,
+					&globals.ring,
 					fd.as_fd(),
 					0,
 					0,
@@ -367,7 +396,14 @@ async fn hash_group(
 						2 * 1024 * 1024,
 					));
 
-					match Read::new(ring, fd.as_fd(), &mut buffer, IoringSqeFlags::empty()).await {
+					match Read::new(
+						&globals.ring,
+						fd.as_fd(),
+						&mut buffer,
+						IoringSqeFlags::empty(),
+					)
+					.await
+					{
 						Ok([]) => {
 							assert_eq!(total_read, group.info.size);
 							break;
@@ -383,7 +419,7 @@ async fn hash_group(
 				}
 
 				let _ = Fadvise::new(
-					ring,
+					&globals.ring,
 					fd.as_fd(),
 					0,
 					0,
@@ -392,7 +428,7 @@ async fn hash_group(
 				)
 				.await;
 
-				let _ = Close::new(ring, fd).await;
+				let _ = Close::new(&globals.ring, fd).await;
 
 				file.hash = hash.finish();
 			})
