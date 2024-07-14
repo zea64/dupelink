@@ -184,16 +184,16 @@ fn main() {
 	};
 
 	for path in args.paths.iter() {
-		let dir = openat2(
+		match openat2(
 			CWD,
 			path,
 			globals.dir_oflags,
 			Mode::empty(),
 			ResolveFlags::empty(),
-		)
-		.unwrap();
-
-		recurse_dir(&globals, dir, path, &mut map);
+		) {
+			Ok(dir) => recurse_dir(&globals, dir, path, &mut map),
+			Err(err) => eprintln!("Error opening {:?}: {}", path, err),
+		}
 	}
 
 	let groups: Vec<FileGroup> = map
@@ -304,9 +304,13 @@ fn recurse_dir(
 
 	let mut path_buf = Vec::new();
 	for output in files {
-		let (statx, file_path) = match output {
-			FutureOrOutput::Output((x, path)) => (x.unwrap(), path),
-			_ => unreachable!(),
+		let (statx, file_path) = output.unwrap_output();
+		let statx = match statx {
+			Ok(statx) => statx,
+			Err(err) => {
+				eprintln!("Error statting {:?}: {}", file_path, err);
+				continue;
+			}
 		};
 
 		if statx.stx_size < globals.minsize || statx.stx_size > globals.maxsize {
@@ -338,20 +342,21 @@ fn recurse_dir(
 	let mut path_buf = Vec::new();
 
 	for new_dir_path in dirs {
-		let new_dirfd = openat2(
+		let path = path_concat(&mut path_buf, dir_path, &new_dir_path);
+
+		match openat2(
 			dirfd.as_fd(),
 			&new_dir_path,
 			globals.dir_oflags,
 			Mode::empty(),
 			globals.dir_open_how.resolve,
-		)
-		.unwrap();
-		recurse_dir(
-			globals,
-			new_dirfd,
-			path_concat(&mut path_buf, dir_path, &new_dir_path),
-			map,
-		);
+		) {
+			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map),
+			Err(err) => {
+				eprintln!("Error opening {:?}: {}", path, err);
+				continue;
+			}
+		}
 	}
 }
 
@@ -368,7 +373,7 @@ async fn hash_group(
 			FutureOrOutput::Future(async move {
 				let _guard = fd_semaphore.wait().await;
 
-				let fd = Openat2::new(
+				let fd = match Openat2::new(
 					&globals.ring,
 					CWD,
 					file.path.first_name(),
@@ -376,7 +381,14 @@ async fn hash_group(
 					IoringSqeFlags::empty(),
 				)
 				.await
-				.unwrap_or_else(|e| panic!("{:?}: {:?}", e, file.path));
+				{
+					Ok(fd) => fd,
+					Err(err) => {
+						file.ino = 0;
+						eprintln!("Error opening {:?}: {}", file.path.first_name(), err);
+						return;
+					}
+				};
 
 				let _ = Fadvise::new(
 					&globals.ring,
@@ -414,7 +426,11 @@ async fn hash_group(
 							hash.write(x);
 						}
 						Err(Errno::AGAIN | Errno::INTR | Errno::CANCELED) => (),
-						Err(x) => panic!("{:?}", x),
+						Err(err) => {
+							file.ino = 0;
+							eprintln!("Error reading {:?}: {}", file.path.first_name(), err);
+							return;
+						}
 					}
 				}
 
@@ -441,7 +457,8 @@ async fn hash_group(
 	group.files.sort_unstable();
 
 	for chunk in group.files.chunk_by(|a, b| a.hash == b.hash) {
-		if chunk.len() <= 1 {
+		// Inode 0 signals an error processing that inode.
+		if chunk.len() <= 1 || chunk[0].ino == 0 {
 			continue;
 		}
 		new_groups.borrow_mut().push(FileGroup {
@@ -454,6 +471,15 @@ async fn hash_group(
 enum FutureOrOutput<F, O> {
 	Future(F),
 	Output(O),
+}
+
+impl<F, O> FutureOrOutput<F, O> {
+	fn unwrap_output(self) -> O {
+		match self {
+			FutureOrOutput::Output(x) => x,
+			_ => unreachable!(),
+		}
+	}
 }
 
 struct SliceJoin<'a, F: Future>(&'a mut [FutureOrOutput<F, <F as Future>::Output>]);
