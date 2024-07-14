@@ -72,26 +72,92 @@ struct FileGroup {
 	files: Vec<FileInfo>,
 }
 
+#[derive(Debug)]
+struct Args {
+	minsize: u64,
+	maxsize: u64,
+	noatime: bool,
+	link: bool,
+	paths: Vec<CString>,
+}
+
+const HELP_STR: &str = "\
+USAGE: dupelink [OPTIONS] <PATHS>...
+
+ARGS:
+	<PATHS...>             Paths to search for duplicates
+
+OPTIONS:
+	-l, --link             Hardlink duplicate files (otherwise only print them)
+	-s, --minsize <SIZE>   [default: 1] Minimum size of files to check
+	-S, --maxsize <SIZE>   [default: u64::MAX] Maximum size of files to check
+";
+
+fn parse_args() -> Result<Args, lexopt::Error> {
+	use lexopt::prelude::*;
+
+	let mut args = Args {
+		minsize: 1,
+		maxsize: u64::MAX,
+		noatime: false,
+		link: false,
+		paths: Vec::new(),
+	};
+
+	let mut parser = lexopt::Parser::from_env();
+	while let Some(arg) = parser.next()? {
+		match arg {
+			Short('l') | Long("link") => {
+				args.link = true;
+			}
+			Short('s') | Long("minsize") => {
+				args.minsize = parser.value()?.parse()?;
+			}
+			Short('S') | Long("maxsize") => {
+				args.maxsize = parser.value()?.parse()?;
+			}
+			Short('a') | Long("noatime") => {
+				args.noatime = true;
+			}
+			Value(path) => {
+				// Args can't have NULs, this unwrap is infallible.
+				args.paths.push(CString::new(path.into_vec()).unwrap());
+			}
+			_ => return Err(arg.unexpected()),
+		}
+	}
+
+	if args.paths.is_empty() {
+		return Err("expected PATHS argument(s)".into());
+	}
+
+	Ok(args)
+}
+
 fn main() {
 	let owned_ring = RefCell::new(Uring::new().unwrap());
 	let ring = &owned_ring;
 	let mut map = HashMap::new();
 
-	for path in std::env::args_os().skip(1) {
-		let mut path = path.into_vec();
-		path.push(0);
-		let path = unsafe { CString::from_vec_with_nul_unchecked(path) };
+	let args = match parse_args() {
+		Ok(x) => x,
+		Err(err) => {
+			eprint!("{}\n{}", err, HELP_STR);
+			return;
+		}
+	};
 
+	for path in args.paths.iter() {
 		let dir = openat2(
 			CWD,
-			&path,
+			path,
 			OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOCTTY | OFlags::CLOEXEC,
 			Mode::empty(),
 			ResolveFlags::empty(),
 		)
 		.unwrap();
 
-		recurse_dir(ring, dir, &path, &mut map);
+		recurse_dir(ring, dir, path, &mut map);
 	}
 
 	let groups: Vec<FileGroup> = map
