@@ -176,7 +176,10 @@ fn recurse_dir(
 						dirfd_borrow,
 						&file_name,
 						AtFlags::empty(),
-						StatxFlags::BASIC_STATS,
+						StatxFlags::INO
+							| StatxFlags::TYPE | StatxFlags::MODE
+							| StatxFlags::UID | StatxFlags::GID
+							| StatxFlags::MNT_ID,
 						&mut statx_buf,
 						IoringSqeFlags::empty(),
 					)
