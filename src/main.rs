@@ -8,6 +8,7 @@ use core::{
 	hash::{Hash, Hasher},
 	iter::Fuse,
 	mem::MaybeUninit,
+	ops::Range,
 	pin::Pin,
 };
 use std::{
@@ -223,22 +224,42 @@ fn main() {
 		})
 		.collect();
 
-	let owned_new_groups: RefCell<Vec<FileGroup>> = Default::default();
-	let new_groups = &owned_new_groups;
+	let groups_4k: RefCell<Vec<FileGroup>> = Default::default();
 
-	let fd_semaphore = Semaphore::new(4096);
+	let fd_semaphore = Semaphore::new(4000);
+
+	const SMALL_READ_SIZE: u64 = 64 * 1024;
 
 	block_on(
 		&globals.ring,
-		IteratorJoin::<4096, _, _>::new(
-			groups
-				.into_iter()
-				.map(|group| hash_group(&globals, group, new_groups, &fd_semaphore)),
-		),
+		IteratorJoin::<4096, _, _>::new(groups.into_iter().map(|group| {
+			hash_group(
+				&globals,
+				group,
+				&groups_4k,
+				&fd_semaphore,
+				0..SMALL_READ_SIZE,
+			)
+		})),
+	);
+
+	let groups_final: RefCell<Vec<FileGroup>> = Default::default();
+
+	block_on(
+		&globals.ring,
+		IteratorJoin::<4096, _, _>::new(groups_4k.into_inner().into_iter().map(|group| {
+			hash_group(
+				&globals,
+				group,
+				&groups_final,
+				&fd_semaphore,
+				(SMALL_READ_SIZE + 1)..u64::MAX,
+			)
+		})),
 	);
 
 	let mut buffer = String::new();
-	for group in owned_new_groups.into_inner() {
+	for group in groups_final.into_inner() {
 		buffer.clear();
 
 		writeln!(&mut buffer, "({}) ", group.info.size).unwrap();
@@ -365,13 +386,20 @@ async fn hash_group(
 	mut group: FileGroup,
 	new_groups: &RefCell<Vec<FileGroup>>,
 	fd_semaphore: &Semaphore,
+	range: Range<u64>,
 ) {
+	if group.info.size < range.start {
+		new_groups.borrow_mut().push(group);
+		return;
+	}
+
 	let mut files: Vec<_> = group
 		.files
 		.iter_mut()
 		.map(|file| {
 			FutureOrOutput::Future(async move {
 				let _guard = fd_semaphore.wait().await;
+				let target_size = core::cmp::min(group.info.size, range.end);
 
 				let fd = match Openat2::new(
 					&globals.ring,
@@ -393,36 +421,37 @@ async fn hash_group(
 				let _ = Fadvise::new(
 					&globals.ring,
 					fd.as_fd(),
-					0,
-					0,
+					range.start,
+					(range.end - range.start).try_into().unwrap_or(u32::MAX),
 					Advice::WillNeed,
 					IoringSqeFlags::empty(),
 				)
 				.await;
 
+				let mut buffer = Box::new_uninit_slice(core::cmp::min(
+					target_size.try_into().unwrap(),
+					2 * 1024 * 1024,
+				));
+
 				let mut hash = std::hash::DefaultHasher::new();
 				let mut total_read = 0;
 				loop {
-					let mut buffer = Box::new_uninit_slice(core::cmp::min(
-						group.info.size.try_into().unwrap(),
-						2 * 1024 * 1024,
-					));
-
+					let to_read = (target_size - total_read).try_into().unwrap();
 					match Read::new(
 						&globals.ring,
 						fd.as_fd(),
-						&mut buffer,
+						&mut buffer[0..to_read],
 						IoringSqeFlags::empty(),
 					)
 					.await
 					{
 						Ok([]) => {
-							assert_eq!(total_read, group.info.size);
+							assert_eq!(total_read, target_size);
 							break;
 						}
 						Ok(x) => {
 							total_read += <usize as TryInto<u64>>::try_into(x.len()).unwrap();
-							assert!(total_read <= group.info.size);
+							assert!(total_read <= target_size);
 							hash.write(x);
 						}
 						Err(Errno::AGAIN | Errno::INTR | Errno::CANCELED) => (),
@@ -437,8 +466,8 @@ async fn hash_group(
 				let _ = Fadvise::new(
 					&globals.ring,
 					fd.as_fd(),
-					0,
-					0,
+					range.start,
+					(range.end - range.start).try_into().unwrap_or(u32::MAX),
 					Advice::DontNeed,
 					IoringSqeFlags::empty(),
 				)
