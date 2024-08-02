@@ -145,6 +145,8 @@ struct Globals {
 	file_open_how: open_how,
 }
 
+const MAX_FILES: usize = 1024;
+
 fn main() {
 	let ring = RefCell::new(Uring::new().unwrap());
 	let mut map = HashMap::new();
@@ -236,21 +238,24 @@ fn main() {
 
 	let groups_small_read: RefCell<Vec<FileGroup>> = Default::default();
 
-	let fd_semaphore = Semaphore::new(4000);
+	let fd_semaphore = Semaphore::new(MAX_FILES);
 
 	const SMALL_READ_SIZE: u64 = 32 * 1024;
 
 	block_on(
 		&globals.ring,
-		IteratorJoin::<4096, _, _>::new(groups.into_iter().map(|group| {
-			hash_group(
-				&globals,
-				group,
-				&groups_small_read,
-				&fd_semaphore,
-				0..SMALL_READ_SIZE,
-			)
-		})),
+		IteratorJoin::<_, _>::new(
+			MAX_FILES,
+			groups.into_iter().map(|group| {
+				hash_group(
+					&globals,
+					group,
+					&groups_small_read,
+					&fd_semaphore,
+					0..SMALL_READ_SIZE,
+				)
+			}),
+		),
 	);
 
 	eprintln!(
@@ -266,15 +271,18 @@ fn main() {
 
 	block_on(
 		&globals.ring,
-		IteratorJoin::<4096, _, _>::new(groups_small_read.into_inner().into_iter().map(|group| {
-			hash_group(
-				&globals,
-				group,
-				&groups_final,
-				&fd_semaphore,
-				(SMALL_READ_SIZE + 1)..u64::MAX,
-			)
-		})),
+		IteratorJoin::<_, _>::new(
+			MAX_FILES,
+			groups_small_read.into_inner().into_iter().map(|group| {
+				hash_group(
+					&globals,
+					group,
+					&groups_final,
+					&fd_semaphore,
+					(SMALL_READ_SIZE + 1)..u64::MAX,
+				)
+			}),
+		),
 	);
 
 	let mut buffer = String::new();
@@ -564,23 +572,21 @@ impl<'a, F: Future> Future for SliceJoin<'a, F> {
 	}
 }
 
-struct IteratorJoin<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> {
-	buffer: [Option<F>; N],
+struct IteratorJoin<F: Future<Output = ()>, I: Iterator<Item = F>> {
+	buffer: Vec<Option<F>>,
 	iter: Fuse<I>,
 }
 
-impl<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> IteratorJoin<N, F, I> {
-	fn new(iter: I) -> Self {
+impl<F: Future<Output = ()>, I: Iterator<Item = F>> IteratorJoin<F, I> {
+	fn new(n: usize, iter: I) -> Self {
 		Self {
-			buffer: [const { None }; N],
+			buffer: (0..n).map(|_| None).collect(),
 			iter: iter.fuse(),
 		}
 	}
 }
 
-impl<const N: usize, F: Future<Output = ()>, I: Iterator<Item = F>> Future
-	for IteratorJoin<N, F, I>
-{
+impl<F: Future<Output = ()>, I: Iterator<Item = F>> Future for IteratorJoin<F, I> {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
