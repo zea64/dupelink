@@ -197,6 +197,11 @@ fn main() {
 		}
 	}
 
+	eprintln!(
+		"{} inodes scanned",
+		map.iter().flat_map(|(_k, v)| v.iter()).count()
+	);
+
 	let groups: Vec<FileGroup> = map
 		.into_iter()
 		.filter_map(|(k, mut v)| {
@@ -224,11 +229,16 @@ fn main() {
 		})
 		.collect();
 
-	let groups_4k: RefCell<Vec<FileGroup>> = Default::default();
+	eprintln!(
+		"{} inodes left",
+		groups.iter().flat_map(|x| x.files.iter()).count()
+	);
+
+	let groups_small_read: RefCell<Vec<FileGroup>> = Default::default();
 
 	let fd_semaphore = Semaphore::new(4000);
 
-	const SMALL_READ_SIZE: u64 = 64 * 1024;
+	const SMALL_READ_SIZE: u64 = 32 * 1024;
 
 	block_on(
 		&globals.ring,
@@ -236,18 +246,27 @@ fn main() {
 			hash_group(
 				&globals,
 				group,
-				&groups_4k,
+				&groups_small_read,
 				&fd_semaphore,
 				0..SMALL_READ_SIZE,
 			)
 		})),
 	);
 
+	eprintln!(
+		"{} inodes left (small read)",
+		groups_small_read
+			.borrow()
+			.iter()
+			.flat_map(|x| x.files.iter())
+			.count()
+	);
+
 	let groups_final: RefCell<Vec<FileGroup>> = Default::default();
 
 	block_on(
 		&globals.ring,
-		IteratorJoin::<4096, _, _>::new(groups_4k.into_inner().into_iter().map(|group| {
+		IteratorJoin::<4096, _, _>::new(groups_small_read.into_inner().into_iter().map(|group| {
 			hash_group(
 				&globals,
 				group,
@@ -262,7 +281,7 @@ fn main() {
 	for group in groups_final.into_inner() {
 		buffer.clear();
 
-		writeln!(&mut buffer, "({}) ", group.info.size).unwrap();
+		//writeln!(&mut buffer, "({}) ", group.info.size).unwrap();
 
 		for file in group.files {
 			for name in file.path.iter() {
@@ -270,7 +289,7 @@ fn main() {
 			}
 		}
 
-		print!("{}", buffer);
+		println!("{}", buffer);
 	}
 }
 
@@ -436,7 +455,10 @@ async fn hash_group(
 				let mut hash = std::hash::DefaultHasher::new();
 				let mut total_read = 0;
 				loop {
-					let to_read = (target_size - total_read).try_into().unwrap();
+					let to_read = core::cmp::min(
+						(target_size - total_read).try_into().unwrap(),
+						buffer.len(),
+					);
 					match Read::new(
 						&globals.ring,
 						fd.as_fd(),
