@@ -1,4 +1,4 @@
-#![feature(new_uninit)]
+#![feature(new_uninit, slice_split_once)]
 
 use core::{
 	cell::RefCell,
@@ -21,7 +21,22 @@ use std::{
 
 use rustix::{
 	fd::{AsFd, BorrowedFd, OwnedFd},
-	fs::{openat2, Advice, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD},
+	fs::{
+		linkat,
+		openat2,
+		renameat_with,
+		unlink,
+		Advice,
+		AtFlags,
+		Dir,
+		FileType,
+		Mode,
+		OFlags,
+		RenameFlags,
+		ResolveFlags,
+		StatxFlags,
+		CWD,
+	},
 	io::Errno,
 	io_uring::{open_how, IoringSqeFlags},
 };
@@ -285,20 +300,78 @@ fn main() {
 		),
 	);
 
+	const TMP_FILE_NAME: &[u8] = b"DUPELINK_TMP_FILE";
+
+	let mut total_deduped_files: u64 = 0;
+	let mut total_deduped_size: u64 = 0;
+
 	let mut buffer = String::new();
+	let mut path_buf = Vec::new();
 	for group in groups_final.into_inner() {
 		buffer.clear();
 
-		//writeln!(&mut buffer, "({}) ", group.info.size).unwrap();
+		let nr_deduped_files: u64 = (group.files.len() - 1).try_into().unwrap();
+		total_deduped_files += nr_deduped_files;
+		let deduped_size = nr_deduped_files * group.info.size;
+		total_deduped_size += deduped_size;
 
-		for file in group.files {
-			for name in file.path.iter() {
-				writeln!(&mut buffer, "{:?}", name).unwrap();
+		writeln!(
+			&mut buffer,
+			"{} bytes each, {} bytes deduped",
+			group.info.size, deduped_size,
+		)
+		.unwrap();
+
+		let mut names = group.files.iter().flat_map(|file| file.path.iter());
+		let master_name = names.next().unwrap();
+
+		writeln!(&mut buffer, "{:?}", master_name).unwrap();
+
+		for name in names {
+			// TODO, check that file hasn't changed.
+			if args.link {
+				name.to_bytes()
+					.rsplit_once(|c| *c == b'/')
+					.unwrap()
+					.0
+					.clone_into(&mut path_buf);
+				path_buf.push(b'/');
+				path_buf.extend_from_slice(TMP_FILE_NAME);
+				path_buf.push(0);
+
+				let tmp_name = CStr::from_bytes_with_nul(&path_buf).unwrap();
+
+				if let Err(err) = linkat(CWD, master_name, CWD, tmp_name, AtFlags::empty()) {
+					eprintln!("Error linking {:?} to {:?}: {}", master_name, tmp_name, err);
+					continue;
+				}
+
+				let mut error_flag = false;
+				if let Err(err) = renameat_with(CWD, name, CWD, tmp_name, RenameFlags::EXCHANGE) {
+					eprintln!("Error exchanging {:?} and {:?}: {}", name, tmp_name, err);
+					// Explicitly no `continue` statement, we want the unlink operation to apply unconditionally
+					error_flag = true;
+				}
+
+				if let Err(err) = unlink(tmp_name) {
+					eprintln!("Error unlinking {:?}: {}", tmp_name, err);
+					continue;
+				}
+
+				if error_flag {
+					continue;
+				}
 			}
+			writeln!(&mut buffer, "{:?}", name).unwrap();
 		}
 
 		println!("{}", buffer);
 	}
+
+	println!(
+		"\nSummary:\n{} files totalling {} bytes",
+		total_deduped_files, total_deduped_size
+	);
 }
 
 fn recurse_dir(
