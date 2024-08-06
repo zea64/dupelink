@@ -95,6 +95,7 @@ struct FileGroup {
 struct Args {
 	minsize: u64,
 	maxsize: u64,
+	fds: usize,
 	noatime: bool,
 	link: bool,
 	paths: Vec<CString>,
@@ -110,6 +111,7 @@ OPTIONS:
 	-l, --link             Hardlink duplicate files (otherwise only print them)
 	-s, --minsize <SIZE>   [default: 1] Minimum size of files to check
 	-S, --maxsize <SIZE>   [default: u64::MAX] Maximum size of files to check
+	-f, --fds <COUNT>      [default: 128] Maximum simultaneously open file descriptors for hashing
 ";
 
 fn parse_args() -> Result<Args, lexopt::Error> {
@@ -118,6 +120,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 	let mut args = Args {
 		minsize: 1,
 		maxsize: u64::MAX,
+		fds: 128,
 		noatime: false,
 		link: false,
 		paths: Vec::new(),
@@ -137,6 +140,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 			}
 			Short('a') | Long("noatime") => {
 				args.noatime = true;
+			}
+			Short('f') | Long("fds") => {
+				args.fds = parser.value()?.parse()?;
 			}
 			Value(path) => {
 				// Args can't have NULs, this unwrap is infallible.
@@ -158,12 +164,11 @@ struct Globals {
 	ring: RefCell<Uring>,
 	minsize: u64,
 	maxsize: u64,
+	fds: usize,
 	dir_oflags: OFlags,
 	dir_open_how: open_how,
 	file_open_how: open_how,
 }
-
-const MAX_FILES: usize = 1024;
 
 fn main() {
 	let ring = RefCell::new(Uring::new().unwrap());
@@ -191,6 +196,7 @@ fn main() {
 		ring,
 		minsize: args.minsize,
 		maxsize: args.maxsize,
+		fds: args.fds,
 		dir_oflags,
 		dir_open_how: open_how {
 			flags: dir_oflags.bits().into(),
@@ -255,7 +261,7 @@ fn main() {
 	let groups_small_read: RefCell<Vec<FileGroup>> = Default::default();
 	let groups_final: RefCell<Vec<FileGroup>> = Default::default();
 
-	let fd_semaphore = Semaphore::new(MAX_FILES);
+	let fd_semaphore = Semaphore::new(globals.fds);
 
 	const SMALL_READ_SIZE: u64 = 16 * 1024;
 
@@ -286,7 +292,7 @@ fn main() {
 		block_on(
 			&globals.ring,
 			IteratorJoin::<_, _>::new(
-				MAX_FILES,
+				globals.fds,
 				groups.into_iter().map(|group| {
 					hash_group(
 						&globals,
@@ -320,7 +326,7 @@ fn main() {
 		block_on(
 			&globals.ring,
 			IteratorJoin::<_, _>::new(
-				MAX_FILES,
+				globals.fds,
 				groups_small_read.into_inner().into_iter().map(|group| {
 					hash_group(
 						&globals,
