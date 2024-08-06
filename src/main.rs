@@ -2,6 +2,7 @@
 
 use core::{
 	cell::RefCell,
+	cmp,
 	ffi::CStr,
 	fmt::{self, Write},
 	future::Future,
@@ -10,13 +11,15 @@ use core::{
 	mem::MaybeUninit,
 	ops::Range,
 	pin::Pin,
+	sync::atomic::{AtomicUsize, Ordering},
+	time::Duration,
 };
 use std::{
-	cmp::Ordering,
 	collections::HashMap,
 	ffi::CString,
 	os::unix::ffi::OsStringExt,
 	task::{Context, Poll},
+	thread,
 };
 
 use rustix::{
@@ -63,13 +66,13 @@ impl PartialEq for FileInfo {
 impl Eq for FileInfo {}
 
 impl PartialOrd for FileInfo {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+	fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
 impl Ord for FileInfo {
-	fn cmp(&self, other: &Self) -> Ordering {
+	fn cmp(&self, other: &Self) -> cmp::Ordering {
 		let self_num = ((self.hash as u128) << 64) + self.ino as u128;
 		let other_num = ((other.hash as u128) << 64) + other.ino as u128;
 		self_num.cmp(&other_num)
@@ -246,59 +249,93 @@ fn main() {
 		})
 		.collect();
 
-	eprintln!(
-		"{} inodes left",
-		groups.iter().flat_map(|x| x.files.iter()).count()
-	);
+	let inodes_small_count = groups.iter().flat_map(|x| x.files.iter()).count();
+	eprintln!("{} inodes left", inodes_small_count);
 
 	let groups_small_read: RefCell<Vec<FileGroup>> = Default::default();
+	let groups_final: RefCell<Vec<FileGroup>> = Default::default();
 
 	let fd_semaphore = Semaphore::new(MAX_FILES);
 
-	const SMALL_READ_SIZE: u64 = 32 * 1024;
+	const SMALL_READ_SIZE: u64 = 16 * 1024;
 
-	block_on(
-		&globals.ring,
-		IteratorJoin::<_, _>::new(
-			MAX_FILES,
-			groups.into_iter().map(|group| {
-				hash_group(
-					&globals,
-					group,
-					&groups_small_read,
-					&fd_semaphore,
-					0..SMALL_READ_SIZE,
-				)
-			}),
-		),
-	);
+	fn progress(total_count: usize, cur_count: &AtomicUsize) {
+		eprintln!();
+		loop {
+			let cur_load = cur_count.load(Ordering::Relaxed);
+			if cur_load == usize::MAX {
+				eprintln!();
+				break;
+			}
+			eprint!(
+				"\r{}/{} ({:.2}%)",
+				cur_load,
+				total_count,
+				100.0 * (cur_load as f32) / (total_count as f32)
+			);
+			thread::sleep(Duration::from_millis(500));
+		}
+	}
 
-	eprintln!(
-		"{} inodes left (small read)",
-		groups_small_read
-			.borrow()
-			.iter()
-			.flat_map(|x| x.files.iter())
-			.count()
-	);
+	let completion_count = AtomicUsize::new(0);
+	thread::scope(|s| {
+		let _ = thread::Builder::new()
+			.name("progress".into())
+			.spawn_scoped(s, || progress(inodes_small_count, &completion_count));
 
-	let groups_final: RefCell<Vec<FileGroup>> = Default::default();
+		block_on(
+			&globals.ring,
+			IteratorJoin::<_, _>::new(
+				MAX_FILES,
+				groups.into_iter().map(|group| {
+					hash_group(
+						&globals,
+						group,
+						&groups_small_read,
+						&fd_semaphore,
+						&completion_count,
+						0..SMALL_READ_SIZE,
+					)
+				}),
+			),
+		);
 
-	block_on(
-		&globals.ring,
-		IteratorJoin::<_, _>::new(
-			MAX_FILES,
-			groups_small_read.into_inner().into_iter().map(|group| {
-				hash_group(
-					&globals,
-					group,
-					&groups_final,
-					&fd_semaphore,
-					(SMALL_READ_SIZE + 1)..u64::MAX,
-				)
-			}),
-		),
-	);
+		completion_count.store(usize::MAX, Ordering::Relaxed);
+	});
+
+	let inodes_final_count = groups_small_read
+		.borrow()
+		.iter()
+		.flat_map(|x| x.files.iter())
+		.count();
+
+	eprintln!("{} inodes left (small read)", inodes_final_count,);
+
+	let completion_count = AtomicUsize::new(0);
+	thread::scope(|s| {
+		let _ = thread::Builder::new()
+			.name("progress".into())
+			.spawn_scoped(s, || progress(inodes_final_count, &completion_count));
+
+		block_on(
+			&globals.ring,
+			IteratorJoin::<_, _>::new(
+				MAX_FILES,
+				groups_small_read.into_inner().into_iter().map(|group| {
+					hash_group(
+						&globals,
+						group,
+						&groups_final,
+						&fd_semaphore,
+						&completion_count,
+						(SMALL_READ_SIZE + 1)..u64::MAX,
+					)
+				}),
+			),
+		);
+
+		completion_count.store(usize::MAX, Ordering::Relaxed);
+	});
 
 	const TMP_FILE_NAME: &[u8] = b"DUPELINK_TMP_FILE";
 
@@ -473,6 +510,7 @@ fn recurse_dir(
 			globals.dir_open_how.resolve,
 		) {
 			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map),
+			Err(Errno::XDEV) => (),
 			Err(err) => {
 				eprintln!("Error opening {:?}: {}", path, err);
 				continue;
@@ -486,6 +524,7 @@ async fn hash_group(
 	mut group: FileGroup,
 	new_groups: &RefCell<Vec<FileGroup>>,
 	fd_semaphore: &Semaphore,
+	completion_count: &AtomicUsize,
 	range: Range<u64>,
 ) {
 	if group.info.size < range.start {
@@ -499,7 +538,9 @@ async fn hash_group(
 		.map(|file| {
 			FutureOrOutput::Future(async move {
 				let _guard = fd_semaphore.wait().await;
-				let target_size = core::cmp::min(group.info.size, range.end);
+				let target_size = cmp::min(group.info.size, range.end);
+
+				completion_count.fetch_add(1, Ordering::Relaxed);
 
 				let fd = match Openat2::new(
 					&globals.ring,
@@ -528,7 +569,7 @@ async fn hash_group(
 				)
 				.await;
 
-				let mut buffer = Box::new_uninit_slice(core::cmp::min(
+				let mut buffer = Box::new_uninit_slice(cmp::min(
 					target_size.try_into().unwrap(),
 					2 * 1024 * 1024,
 				));
@@ -536,10 +577,8 @@ async fn hash_group(
 				let mut hash = std::hash::DefaultHasher::new();
 				let mut total_read = 0;
 				loop {
-					let to_read = core::cmp::min(
-						(target_size - total_read).try_into().unwrap(),
-						buffer.len(),
-					);
+					let to_read =
+						cmp::min((target_size - total_read).try_into().unwrap(), buffer.len());
 					match Read::new(
 						&globals.ring,
 						fd.as_fd(),
