@@ -9,6 +9,7 @@ use core::{
 	hash::{Hash, Hasher},
 	iter::Fuse,
 	mem::MaybeUninit,
+	num::ParseIntError,
 	ops::Range,
 	pin::Pin,
 	sync::atomic::{AtomicUsize, Ordering},
@@ -133,10 +134,10 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 				args.link = true;
 			}
 			Short('s') | Long("minsize") => {
-				args.minsize = parser.value()?.parse()?;
+				args.minsize = parser.value()?.parse_with(parse_size)?;
 			}
 			Short('S') | Long("maxsize") => {
-				args.maxsize = parser.value()?.parse()?;
+				args.maxsize = parser.value()?.parse_with(parse_size)?;
 			}
 			Short('a') | Long("noatime") => {
 				args.noatime = true;
@@ -791,4 +792,26 @@ fn path_concat<'a, 'b>(path_buf: &'a mut Vec<u8>, str1: &'b CStr, str2: &'b CStr
 	path_buf.push(0);
 
 	CStr::from_bytes_with_nul(path_buf).unwrap()
+}
+
+fn parse_size(mut s: &str) -> Result<u64, ParseIntError> {
+	const TABLE: &[(char, u64)] = &[
+		('k', 1024u64.pow(1)),
+		('K', 1000u64.pow(1)),
+		('m', 1024u64.pow(2)),
+		('M', 1000u64.pow(2)),
+		('g', 1024u64.pow(3)),
+		('G', 1000u64.pow(3)),
+		('t', 1024u64.pow(4)),
+		('T', 1000u64.pow(4)),
+	];
+
+	let mut multiplier = 1;
+	let last_char = s.chars().last().unwrap_or_default();
+	if let Some((_, mult)) = TABLE.iter().find(|(c, _)| *c == last_char) {
+		s = &s[0..s.len() - 1];
+		multiplier = *mult;
+	}
+
+	s.parse().map(|x: u64| x * multiplier)
 }
