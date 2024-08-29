@@ -42,12 +42,12 @@ use rustix::{
 		CWD,
 	},
 	io::Errno,
-	io_uring::{open_how, IoringSqeFlags},
+	io_uring::open_how,
 };
 use uring_async::{
 	block_on,
-	ops::{Close, Fadvise, Openat2, Read, Statx},
-	Semaphore,
+	ops::{Close, Fadvise, Openat2, Read, Statx, UringOp},
+	sync::Semaphore,
 	Uring,
 };
 
@@ -437,8 +437,8 @@ fn recurse_dir(
 				let file_name = dentry.file_name().to_owned();
 				let dirfd_borrow: BorrowedFd<'_> = dirfd.as_fd();
 				files.push(FutureOrOutput::Future(async move {
-					let mut statx_buf = MaybeUninit::uninit();
-					let statx = Statx::new(
+					let mut statx_buf = unsafe { MaybeUninit::zeroed().assume_init() };
+					let ret = Statx::new(
 						&globals.ring,
 						dirfd_borrow,
 						&file_name,
@@ -448,12 +448,10 @@ fn recurse_dir(
 							| StatxFlags::UID | StatxFlags::GID
 							| StatxFlags::MNT_ID,
 						&mut statx_buf,
-						IoringSqeFlags::empty(),
 					)
-					.await
-					.map(|statx| *statx);
+					.await;
 
-					(statx, file_name)
+					(ret.map(|_| statx_buf), file_name)
 				}));
 			}
 			FileType::Directory => {
@@ -554,7 +552,6 @@ async fn hash_group(
 					CWD,
 					file.path.first_name(),
 					&globals.file_open_how,
-					IoringSqeFlags::empty(),
 				)
 				.await
 				{
@@ -566,42 +563,37 @@ async fn hash_group(
 					}
 				};
 
-				let _ = Fadvise::new(
+				// This will add it to the sq but *not* submit. We want to submit *with* the next read. Cleanup will happen later.
+				let fadvise = Fadvise::new(
 					&globals.ring,
 					fd.as_fd(),
 					range.start,
 					(range.end - range.start).try_into().unwrap_or(u32::MAX),
 					Advice::WillNeed,
-					IoringSqeFlags::empty(),
 				)
-				.await;
+				.link();
 
-				let mut buffer = Box::new_uninit_slice(cmp::min(
-					target_size.try_into().unwrap(),
-					2 * 1024 * 1024,
-				));
+				let mut buffer: Box<[u8]> =
+					vec![0; cmp::min(target_size.try_into().unwrap(), 2 * 1024 * 1024,)].into();
 
 				let mut hash = std::hash::DefaultHasher::new();
-				let mut total_read = 0;
+				let mut total_read: u64 = 0;
 				loop {
 					let to_read =
 						cmp::min((target_size - total_read).try_into().unwrap(), buffer.len());
-					match Read::new(
-						&globals.ring,
-						fd.as_fd(),
-						&mut buffer[0..to_read],
-						IoringSqeFlags::empty(),
-					)
-					.await
-					{
-						Ok([]) => {
+					let read =
+						Read::new(&globals.ring, fd.as_fd(), u64::MAX, &mut buffer[0..to_read])
+							.await;
+
+					match read {
+						Ok(0) => {
 							assert_eq!(total_read, target_size);
 							break;
 						}
 						Ok(x) => {
-							total_read += <usize as TryInto<u64>>::try_into(x.len()).unwrap();
+							total_read += <u32 as Into<u64>>::into(x);
 							assert!(total_read <= target_size);
-							hash.write(x);
+							hash.write(&buffer[0..(x.try_into().unwrap())]);
 						}
 						Err(Errno::AGAIN | Errno::INTR | Errno::CANCELED) => (),
 						Err(err) => {
@@ -612,13 +604,15 @@ async fn hash_group(
 					}
 				}
 
+				// Cleanup fadvise from earlier (it doesn't have a good drop impl yet).
+				let _ = fadvise.await;
+
 				let _ = Fadvise::new(
 					&globals.ring,
 					fd.as_fd(),
 					range.start,
 					(range.end - range.start).try_into().unwrap_or(u32::MAX),
 					Advice::DontNeed,
-					IoringSqeFlags::empty(),
 				)
 				.await;
 
