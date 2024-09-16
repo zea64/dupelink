@@ -1,5 +1,7 @@
 #![feature(new_uninit, slice_split_once, noop_waker)]
 
+mod scan;
+
 use core::{
 	cell::{Cell, RefCell},
 	cmp,
@@ -8,7 +10,6 @@ use core::{
 	future::Future,
 	hash::{Hash, Hasher},
 	iter::Fuse,
-	mem::MaybeUninit,
 	num::ParseIntError,
 	ops::Range,
 	pin::Pin,
@@ -19,10 +20,11 @@ use std::{
 	ffi::CString,
 	os::unix::ffi::OsStringExt,
 	task::{Context, Poll},
+	time::SystemTime,
 };
 
 use rustix::{
-	fd::{AsFd, BorrowedFd, OwnedFd},
+	fd::AsFd,
 	fs::{
 		linkat,
 		openat2,
@@ -30,20 +32,17 @@ use rustix::{
 		unlink,
 		Advice,
 		AtFlags,
-		Dir,
-		FileType,
 		Mode,
 		OFlags,
 		RenameFlags,
 		ResolveFlags,
-		StatxFlags,
 		CWD,
 	},
 	io::Errno,
 	io_uring::open_how,
 };
 use uring_async::{
-	ops::{Close, Fadvise, Openat2, Read, Statx, UringOp},
+	ops::{Close, Fadvise, Openat2, Read, UringOp},
 	sync::Semaphore,
 	Uring,
 };
@@ -52,6 +51,7 @@ use uring_async::{
 struct FileInfo {
 	ino: u64,
 	hash: u64,
+	ctime: SystemTime,
 	path: MegaName,
 }
 
@@ -216,7 +216,7 @@ fn main() {
 			Mode::empty(),
 			ResolveFlags::empty(),
 		) {
-			Ok(dir) => recurse_dir(&globals, dir, path, &mut map),
+			Ok(dir) => scan::recurse_dir(&globals, dir, path, &mut map),
 			Err(err) => eprintln!("Error opening {:?}: {}", path, err),
 		}
 	}
@@ -241,6 +241,7 @@ fn main() {
 					.map(|infos| FileInfo {
 						ino: infos[0].ino,
 						hash: infos[0].hash,
+						ctime: infos[0].ctime,
 						path: infos.iter().map(|x| x.path.first_name()).into(),
 					})
 					.collect();
@@ -316,7 +317,7 @@ fn main() {
 
 	let mut buffer = String::new();
 	let mut path_buf = Vec::new();
-	for group in groups_final.into_inner() {
+	for mut group in groups_final.into_inner() {
 		buffer.clear();
 
 		let nr_deduped_files: u64 = (group.files.len() - 1).try_into().unwrap();
@@ -330,6 +331,9 @@ fn main() {
 			group.info.size, deduped_size,
 		)
 		.unwrap();
+
+		// Sort by ctime
+		group.files.sort_unstable_by(|a, b| a.ctime.cmp(&b.ctime));
 
 		let mut names = group.files.iter().flat_map(|file| file.path.iter());
 		let master_name = names.next().unwrap();
@@ -393,114 +397,10 @@ fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
 		}
 
 		let mut borrowed_ring = ring.borrow_mut();
-		if borrowed_ring.sq_enqueued() != 0 || borrowed_ring.in_flight() != 0 {
-			borrowed_ring.submit(1);
-		}
-	}
-}
+		let in_flight = borrowed_ring.in_flight();
 
-fn recurse_dir(
-	globals: &Globals,
-	dirfd: OwnedFd,
-	dir_path: &CStr,
-	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
-) {
-	let dir_iter = Dir::read_from(dirfd.as_fd()).unwrap();
-
-	let mut files = Vec::new();
-	let mut dirs = Vec::new();
-
-	for dentry in dir_iter.skip(2) {
-		let dentry = dentry.unwrap();
-
-		match dentry.file_type() {
-			FileType::RegularFile => {
-				let file_name = dentry.file_name().to_owned();
-				let dirfd_borrow: BorrowedFd<'_> = dirfd.as_fd();
-				files.push(FutureOrOutput::Future(async move {
-					let mut statx_buf = unsafe { MaybeUninit::zeroed().assume_init() };
-					let ret = Statx::new(
-						&globals.ring,
-						dirfd_borrow,
-						&file_name,
-						AtFlags::empty(),
-						StatxFlags::INO
-							| StatxFlags::TYPE | StatxFlags::MODE
-							| StatxFlags::UID | StatxFlags::GID
-							| StatxFlags::MNT_ID,
-						&mut statx_buf,
-					)
-					.await;
-
-					(ret.map(|_| statx_buf), file_name)
-				}));
-			}
-			FileType::Directory => {
-				dirs.push(dentry.file_name().to_owned());
-			}
-			_ => (),
-		}
-	}
-
-	dirs.shrink_to_fit();
-
-	block_on(&globals.ring, SliceJoin(&mut files));
-
-	let mut path_buf = Vec::new();
-	for output in files {
-		let (statx, file_path) = output.unwrap_output();
-		let statx = match statx {
-			Ok(statx) => statx,
-			Err(err) => {
-				eprintln!("Error statting {:?}: {}", file_path, err);
-				continue;
-			}
-		};
-
-		if statx.stx_size < globals.minsize || statx.stx_size > globals.maxsize {
-			continue;
-		}
-
-		let mut hasher = std::hash::DefaultHasher::new();
-		hasher.write_u16(statx.stx_mode);
-		hasher.write_u32(statx.stx_uid);
-		hasher.write_u32(statx.stx_gid);
-		hasher.write_u64(statx.stx_mnt_id);
-
-		let group_info = GroupInfo {
-			size: statx.stx_size,
-			hashed: hasher.finish(),
-		};
-
-		path_concat(&mut path_buf, dir_path, &file_path);
-		let full_path = CString::from_vec_with_nul(path_buf.clone()).unwrap();
-		let file_info = FileInfo {
-			ino: statx.stx_ino,
-			path: MegaName::from_cstring(full_path),
-			hash: 0,
-		};
-
-		map.entry(group_info).or_default().push(file_info);
-	}
-
-	let mut path_buf = Vec::new();
-
-	for new_dir_path in dirs {
-		let path = path_concat(&mut path_buf, dir_path, &new_dir_path);
-
-		match openat2(
-			dirfd.as_fd(),
-			&new_dir_path,
-			globals.dir_oflags,
-			Mode::empty(),
-			globals.dir_open_how.resolve,
-		) {
-			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map),
-			Err(Errno::XDEV) => (),
-			Err(err) => {
-				eprintln!("Error opening {:?}: {}", path, err);
-				continue;
-			}
+		if borrowed_ring.sq_enqueued() != 0 || in_flight != 0 {
+			borrowed_ring.submit(in_flight / 8 + 1);
 		}
 	}
 }
@@ -534,7 +434,7 @@ async fn hash_group(
 					let integer_part = new_completion_count * 100 / total_count;
 					let frac_part = new_completion_count * 10000 / total_count - integer_part * 100;
 
-					eprint!("\r[{new_completion_count}/{total_count}] ({integer_part:.2}.{frac_part:.2}%)");
+					eprint!("{}", format!("\r[{new_completion_count}/{total_count}] ({integer_part:.2}.{frac_part:.2}%)"));
 
 					let fd = match Openat2::new(
 						&globals.ring,
