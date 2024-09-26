@@ -25,6 +25,7 @@ use std::{
 
 use rustix::{
 	fs::{
+		self,
 		linkat,
 		openat2,
 		renameat_with,
@@ -34,8 +35,10 @@ use rustix::{
 		OFlags,
 		RenameFlags,
 		ResolveFlags,
+		StatxFlags,
 		CWD,
 	},
+	io::Errno,
 	io_uring::open_how,
 };
 use uring_async::{sync::Semaphore, Uring};
@@ -76,6 +79,12 @@ struct GroupInfo {
 	hashed: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LinkMethod {
+	Hardlink,
+	Reflink,
+}
+
 #[derive(Debug)]
 struct FileGroup {
 	info: GroupInfo,
@@ -89,6 +98,7 @@ struct Args {
 	fds: usize,
 	noatime: bool,
 	link: bool,
+	link_method: LinkMethod,
 	paths: Vec<CString>,
 }
 
@@ -99,7 +109,8 @@ ARGS:
 	<PATHS...>             Paths to search for duplicates
 
 OPTIONS:
-	-l, --link             Hardlink duplicate files (otherwise only print them)
+	-l, --link             Link duplicate files (otherwise only print them)
+	-R, --reflink          Use reflinks instead of hardlinks (also allows deduping files with different metadata)
 	-s, --minsize <SIZE>   [default: 1] Minimum size of files to check
 	-S, --maxsize <SIZE>   [default: u64::MAX] Maximum size of files to check
 	-f, --fds <COUNT>      [default: 128] Maximum simultaneously open file descriptors for hashing
@@ -114,6 +125,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 		fds: 128,
 		noatime: false,
 		link: false,
+		link_method: LinkMethod::Hardlink,
 		paths: Vec::new(),
 	};
 
@@ -122,6 +134,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 		match arg {
 			Short('l') | Long("link") => {
 				args.link = true;
+			}
+			Short('R') | Long("reflink") => {
+				args.link_method = LinkMethod::Reflink;
 			}
 			Short('s') | Long("minsize") => {
 				args.minsize = parser.value()?.parse_with(parse_size)?;
@@ -153,6 +168,8 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 #[derive(Debug)]
 struct Globals {
 	ring: RefCell<Uring>,
+	link_method: LinkMethod,
+	statx_flags: StatxFlags,
 	minsize: u64,
 	maxsize: u64,
 	fds: usize,
@@ -183,8 +200,19 @@ fn main() {
 			OFlags::empty()
 		};
 	let dir_oflags = file_oflags | OFlags::DIRECTORY;
+	let statx_flags = StatxFlags::INO
+		| StatxFlags::TYPE
+		| StatxFlags::MNT_ID
+		| StatxFlags::CTIME
+		| match args.link_method {
+			LinkMethod::Hardlink => StatxFlags::MODE | StatxFlags::UID | StatxFlags::GID,
+			LinkMethod::Reflink => StatxFlags::empty(),
+		};
+
 	let globals = Globals {
 		ring,
+		link_method: args.link_method,
+		statx_flags,
 		minsize: args.minsize,
 		maxsize: args.maxsize,
 		fds: args.fds,
@@ -210,6 +238,16 @@ fn main() {
 			ResolveFlags::empty(),
 		) {
 			Ok(dir) => scan::recurse_dir(&globals, dir, path, &mut map),
+			Err(Errno::NOTDIR) => {
+				match fs::statx(CWD, path, AtFlags::empty(), globals.statx_flags) {
+					Ok(stat) => {
+						if let Err(err) = scan::record_stat(&globals, &mut map, stat, c".", path) {
+							eprintln!("Error statting {:?}: {}", path, err);
+						}
+					}
+					Err(err) => eprintln!("Error statting {:?}: {}", path, err),
+				}
+			}
 			Err(err) => eprintln!("Error opening {:?}: {}", path, err),
 		}
 	}

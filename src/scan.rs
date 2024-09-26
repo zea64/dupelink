@@ -1,9 +1,9 @@
-use core::{ffi::CStr, hash::Hasher, mem::MaybeUninit, time::Duration};
-use std::{collections::HashMap, ffi::CString, time::SystemTime};
+use core::{error::Error, ffi::CStr, fmt, hash::Hasher, mem::MaybeUninit, time::Duration};
+use std::{collections::HashMap, ffi::CString, hash::DefaultHasher, time::SystemTime};
 
 use rustix::{
 	fd::{AsFd, BorrowedFd, OwnedFd},
-	fs::{openat2, AtFlags, Dir, FileType, Mode, StatxFlags},
+	fs::{openat2, AtFlags, Dir, FileType, Mode, Statx as StatxStruct, StatxFlags},
 	io::Errno,
 };
 use uring_async::ops::Statx;
@@ -44,10 +44,7 @@ pub fn recurse_dir(
 						dirfd_borrow,
 						&file_name,
 						AtFlags::empty(),
-						StatxFlags::INO
-							| StatxFlags::TYPE | StatxFlags::MODE
-							| StatxFlags::UID | StatxFlags::GID
-							| StatxFlags::MNT_ID | StatxFlags::CTIME,
+						globals.statx_flags,
 						&mut statx_buf,
 					)
 					.await;
@@ -66,7 +63,6 @@ pub fn recurse_dir(
 
 	block_on(&globals.ring, SliceJoin(&mut files));
 
-	let mut path_buf = Vec::new();
 	for output in files {
 		let (statx, file_path) = output.unwrap_output();
 		let statx = match statx {
@@ -77,33 +73,9 @@ pub fn recurse_dir(
 			}
 		};
 
-		if statx.stx_size < globals.minsize || statx.stx_size > globals.maxsize {
-			continue;
+		if let Err(err) = record_stat(globals, map, statx, dir_path, &file_path) {
+			eprintln!("Error statting {:?}: {}", file_path, err)
 		}
-
-		let mut hasher = std::hash::DefaultHasher::new();
-		hasher.write_u16(statx.stx_mode);
-		hasher.write_u32(statx.stx_uid);
-		hasher.write_u32(statx.stx_gid);
-		hasher.write_u64(statx.stx_mnt_id);
-
-		let group_info = GroupInfo {
-			size: statx.stx_size,
-			hashed: hasher.finish(),
-		};
-
-		path_concat(&mut path_buf, dir_path, &file_path);
-		let full_path = CString::from_vec_with_nul(path_buf.clone()).unwrap();
-		let file_info = FileInfo {
-			ino: statx.stx_ino,
-			hash: 0,
-			ctime: SystemTime::UNIX_EPOCH
-				+ Duration::from_secs(statx.stx_ctime.tv_sec.try_into().unwrap())
-				+ Duration::from_nanos(statx.stx_ctime.tv_nsec.into()),
-			path: MegaName::from_cstring(full_path),
-		};
-
-		map.entry(group_info).or_default().push(file_info);
 	}
 
 	let mut path_buf = Vec::new();
@@ -126,4 +98,74 @@ pub fn recurse_dir(
 			}
 		}
 	}
+}
+
+#[derive(Debug)]
+pub struct RecordStatError {
+	expected: StatxFlags,
+	got: StatxFlags,
+}
+
+impl Error for RecordStatError {
+	fn source(&self) -> Option<&(dyn Error + 'static)> {
+		None
+	}
+}
+
+impl fmt::Display for RecordStatError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"Expected statx flags {:#8x}, got {:#8x} (diff={:#8x})",
+			self.expected,
+			self.got,
+			self.expected - self.got
+		)
+	}
+}
+
+pub fn record_stat(
+	globals: &Globals,
+	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
+	statx: StatxStruct,
+	dir_path: &CStr,
+	file_path: &CStr,
+) -> Result<(), RecordStatError> {
+	let set_flags = StatxFlags::from_bits_truncate(statx.stx_mask);
+	if !set_flags.contains(globals.statx_flags) {
+		return Err(RecordStatError {
+			expected: globals.statx_flags,
+			got: set_flags,
+		});
+	}
+
+	if statx.stx_size < globals.minsize || statx.stx_size > globals.maxsize {
+		return Ok(());
+	}
+
+	let mut hasher = DefaultHasher::new();
+	hasher.write_u16(statx.stx_mode);
+	hasher.write_u32(statx.stx_uid);
+	hasher.write_u32(statx.stx_gid);
+	hasher.write_u64(statx.stx_mnt_id);
+
+	let group_info = GroupInfo {
+		size: statx.stx_size,
+		hashed: hasher.finish(),
+	};
+
+	let mut path_buf = Vec::new();
+	path_concat(&mut path_buf, dir_path, file_path);
+	let full_path = CString::from_vec_with_nul(path_buf.clone()).unwrap();
+	let file_info = FileInfo {
+		ino: statx.stx_ino,
+		hash: 0,
+		ctime: SystemTime::UNIX_EPOCH
+			+ Duration::from_secs(statx.stx_ctime.tv_sec.try_into().unwrap())
+			+ Duration::from_nanos(statx.stx_ctime.tv_nsec.into()),
+		path: MegaName::from_cstring(full_path),
+	};
+
+	map.entry(group_info).or_default().push(file_info);
+	Ok(())
 }
