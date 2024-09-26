@@ -1,5 +1,6 @@
 #![feature(new_uninit, slice_split_once, noop_waker)]
 
+mod link;
 mod read;
 mod scan;
 
@@ -7,7 +8,7 @@ use core::{
 	cell::{Cell, RefCell},
 	cmp,
 	ffi::CStr,
-	fmt::{self, Write},
+	fmt,
 	future::Future,
 	hash::Hash,
 	iter::Fuse,
@@ -24,20 +25,7 @@ use std::{
 };
 
 use rustix::{
-	fs::{
-		self,
-		linkat,
-		openat2,
-		renameat_with,
-		unlink,
-		AtFlags,
-		Mode,
-		OFlags,
-		RenameFlags,
-		ResolveFlags,
-		StatxFlags,
-		CWD,
-	},
+	fs::{self, openat2, AtFlags, Mode, OFlags, ResolveFlags, StatxFlags, CWD},
 	io::Errno,
 	io_uring::open_how,
 };
@@ -169,6 +157,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 struct Globals {
 	ring: RefCell<Uring>,
 	link_method: LinkMethod,
+	link: bool,
 	statx_flags: StatxFlags,
 	minsize: u64,
 	maxsize: u64,
@@ -212,6 +201,7 @@ fn main() {
 	let globals = Globals {
 		ring,
 		link_method: args.link_method,
+		link: args.link,
 		statx_flags,
 		minsize: args.minsize,
 		maxsize: args.maxsize,
@@ -341,76 +331,15 @@ fn main() {
 		),
 	);
 
-	const TMP_FILE_NAME: &[u8] = b"DUPELINK_TMP_FILE";
-
 	let mut total_deduped_files: u64 = 0;
 	let mut total_deduped_size: u64 = 0;
 
-	let mut buffer = String::new();
-	let mut path_buf = Vec::new();
-	for mut group in groups_final.into_inner() {
-		buffer.clear();
-
-		let nr_deduped_files: u64 = (group.files.len() - 1).try_into().unwrap();
-		total_deduped_files += nr_deduped_files;
-		let deduped_size = nr_deduped_files * group.info.size;
-		total_deduped_size += deduped_size;
-
-		writeln!(
-			&mut buffer,
-			"{} bytes each, {} bytes deduped",
-			group.info.size, deduped_size,
-		)
-		.unwrap();
-
-		// Sort by ctime
-		group.files.sort_unstable_by(|a, b| a.ctime.cmp(&b.ctime));
-
-		let mut names = group.files.iter().flat_map(|file| file.path.iter());
-		let master_name = names.next().unwrap();
-
-		writeln!(&mut buffer, "{:?}", master_name).unwrap();
-
-		for name in names {
-			// TODO, check that file hasn't changed.
-			if args.link {
-				name.to_bytes()
-					.rsplit_once(|c| *c == b'/')
-					.unwrap()
-					.0
-					.clone_into(&mut path_buf);
-				path_buf.push(b'/');
-				path_buf.extend_from_slice(TMP_FILE_NAME);
-				path_buf.push(0);
-
-				let tmp_name = CStr::from_bytes_with_nul(&path_buf).unwrap();
-
-				if let Err(err) = linkat(CWD, master_name, CWD, tmp_name, AtFlags::empty()) {
-					eprintln!("Error linking {:?} to {:?}: {}", master_name, tmp_name, err);
-					continue;
-				}
-
-				let mut error_flag = false;
-				if let Err(err) = renameat_with(CWD, name, CWD, tmp_name, RenameFlags::EXCHANGE) {
-					eprintln!("Error exchanging {:?} and {:?}: {}", name, tmp_name, err);
-					// Explicitly no `continue` statement, we want the unlink operation to apply unconditionally
-					error_flag = true;
-				}
-
-				if let Err(err) = unlink(tmp_name) {
-					eprintln!("Error unlinking {:?}: {}", tmp_name, err);
-					continue;
-				}
-
-				if error_flag {
-					continue;
-				}
-			}
-			writeln!(&mut buffer, "{:?}", name).unwrap();
-		}
-
-		println!("{}", buffer);
-	}
+	link::link(
+		&globals,
+		groups_final.into_inner(),
+		&mut total_deduped_files,
+		&mut total_deduped_size,
+	);
 
 	println!(
 		"\nSummary:\n{} files totalling {} bytes",
