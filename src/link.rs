@@ -2,7 +2,7 @@ use core::{ffi::CStr, fmt::Write};
 
 use rustix::fs::{linkat, renameat_with, unlink, AtFlags, RenameFlags, CWD};
 
-use crate::{FileGroup, Globals};
+use crate::{FileGroup, Globals, LinkMethod};
 
 const TMP_FILE_NAME: &[u8] = b"DUPELINK_TMP_FILE";
 
@@ -13,7 +13,6 @@ pub fn link(
 	total_deduped_size: &mut u64,
 ) {
 	let mut buffer = String::new();
-	let mut path_buf = Vec::new();
 	for mut group in groups {
 		buffer.clear();
 
@@ -32,49 +31,63 @@ pub fn link(
 		// Sort by ctime
 		group.files.sort_unstable_by(|a, b| a.ctime.cmp(&b.ctime));
 
-		let mut names = group.files.iter().flat_map(|file| file.path.iter());
-		let master_name = names.next().unwrap();
-
-		writeln!(&mut buffer, "{:?}", master_name).unwrap();
-
-		for name in names {
-			// TODO, check that file hasn't changed.
-			if globals.link {
-				name.to_bytes()
-					.rsplit_once(|c| *c == b'/')
-					.unwrap()
-					.0
-					.clone_into(&mut path_buf);
-				path_buf.push(b'/');
-				path_buf.extend_from_slice(TMP_FILE_NAME);
-				path_buf.push(0);
-
-				let tmp_name = CStr::from_bytes_with_nul(&path_buf).unwrap();
-
-				if let Err(err) = linkat(CWD, master_name, CWD, tmp_name, AtFlags::empty()) {
-					eprintln!("Error linking {:?} to {:?}: {}", master_name, tmp_name, err);
-					continue;
-				}
-
-				let mut error_flag = false;
-				if let Err(err) = renameat_with(CWD, name, CWD, tmp_name, RenameFlags::EXCHANGE) {
-					eprintln!("Error exchanging {:?} and {:?}: {}", name, tmp_name, err);
-					// Explicitly no `continue` statement, we want the unlink operation to apply unconditionally
-					error_flag = true;
-				}
-
-				if let Err(err) = unlink(tmp_name) {
-					eprintln!("Error unlinking {:?}: {}", tmp_name, err);
-					continue;
-				}
-
-				if error_flag {
-					continue;
-				}
-			}
-			writeln!(&mut buffer, "{:?}", name).unwrap();
+		match globals.link_method {
+			LinkMethod::Hardlink => hardlink(&mut buffer, group, globals.link),
+			LinkMethod::Reflink => reflink(&mut buffer, group, globals.link),
 		}
 
 		println!("{}", buffer);
 	}
+}
+
+fn hardlink(write_buffer: &mut impl Write, group: FileGroup, link: bool) {
+	let mut names = group.files.iter().flat_map(|file| file.path.iter());
+	let master_name = names.next().unwrap();
+
+	let mut path_buf = Vec::new();
+
+	writeln!(write_buffer, "{:?}", master_name).unwrap();
+
+	for name in names {
+		// TODO, check that file hasn't changed.
+		if link {
+			name.to_bytes()
+				.rsplit_once(|c| *c == b'/')
+				.unwrap()
+				.0
+				.clone_into(&mut path_buf);
+			path_buf.push(b'/');
+			path_buf.extend_from_slice(TMP_FILE_NAME);
+			path_buf.push(0);
+
+			let tmp_name = CStr::from_bytes_with_nul(&path_buf).unwrap();
+
+			if let Err(err) = linkat(CWD, master_name, CWD, tmp_name, AtFlags::empty()) {
+				eprintln!("Error linking {:?} to {:?}: {}", master_name, tmp_name, err);
+				continue;
+			}
+
+			let mut error_flag = false;
+			if let Err(err) = renameat_with(CWD, name, CWD, tmp_name, RenameFlags::EXCHANGE) {
+				eprintln!("Error exchanging {:?} and {:?}: {}", name, tmp_name, err);
+				// Explicitly no `continue` statement, we want the unlink operation to apply unconditionally
+				error_flag = true;
+			}
+
+			if let Err(err) = unlink(tmp_name) {
+				eprintln!("Error unlinking {:?}: {}", tmp_name, err);
+				continue;
+			}
+
+			if error_flag {
+				continue;
+			}
+		}
+
+		writeln!(write_buffer, "{:?}", name).unwrap();
+	}
+}
+
+fn reflink(_write_buffer: &mut impl Write, _group: FileGroup, _link: bool) {
+	unimplemented!()
 }
