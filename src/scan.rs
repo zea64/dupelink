@@ -1,4 +1,12 @@
-use core::{error::Error, ffi::CStr, fmt, hash::Hasher, mem::MaybeUninit, time::Duration};
+use core::{
+	cell::Cell,
+	error::Error,
+	ffi::CStr,
+	fmt,
+	hash::Hasher,
+	mem::MaybeUninit,
+	time::Duration,
+};
 use std::{collections::HashMap, ffi::CString, hash::DefaultHasher, time::SystemTime};
 
 use rustix::{
@@ -24,6 +32,7 @@ pub fn recurse_dir(
 	dirfd: OwnedFd,
 	dir_path: &CStr,
 	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
+	scanned_files: &Cell<usize>,
 ) {
 	let dir_iter = Dir::read_from(dirfd.as_fd()).unwrap();
 
@@ -61,7 +70,13 @@ pub fn recurse_dir(
 
 	dirs.shrink_to_fit();
 
-	block_on(&globals.ring, SliceJoin(&mut files));
+	scanned_files.set(scanned_files.get() + files.len());
+
+	block_on(
+		&globals.ring,
+		&|| eprint!("{}", format!("Scanning {}...\r", scanned_files.get())),
+		SliceJoin(&mut files),
+	);
 
 	for output in files {
 		let (statx, file_path) = output.unwrap_output();
@@ -90,7 +105,7 @@ pub fn recurse_dir(
 			Mode::empty(),
 			globals.dir_open_how.resolve,
 		) {
-			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map),
+			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map, scanned_files),
 			Err(Errno::XDEV) => (),
 			Err(err) => {
 				eprintln!("Error opening {:?}: {}", path, err);

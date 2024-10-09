@@ -1,4 +1,5 @@
 #![feature(new_uninit, slice_split_once, noop_waker)]
+#![allow(clippy::format_in_format_args)]
 
 mod link;
 mod read;
@@ -227,7 +228,9 @@ fn main() {
 			Mode::empty(),
 			ResolveFlags::empty(),
 		) {
-			Ok(dir) => scan::recurse_dir(&globals, dir, path, &mut map),
+			Ok(dir) => {
+				scan::recurse_dir(&globals, dir, path, &mut map, &Cell::new(0));
+			}
 			Err(Errno::NOTDIR) => {
 				match fs::statx(CWD, path, AtFlags::empty(), globals.statx_flags) {
 					Ok(stat) => {
@@ -288,6 +291,7 @@ fn main() {
 	let completion_count = Cell::new(0usize);
 	block_on(
 		&globals.ring,
+		&|| print_progress(&completion_count, inodes_small_count),
 		IteratorJoin::<_, _>::new(
 			globals.fds,
 			groups.into_iter().map(|group| {
@@ -297,7 +301,6 @@ fn main() {
 					&groups_small_read,
 					&fd_semaphore,
 					&completion_count,
-					inodes_small_count,
 					0..SMALL_READ_SIZE,
 				)
 			}),
@@ -315,6 +318,7 @@ fn main() {
 	let completion_count = Cell::new(0usize);
 	block_on(
 		&globals.ring,
+		&|| print_progress(&completion_count, inodes_final_count),
 		IteratorJoin::<_, _>::new(
 			globals.fds,
 			groups_small_read.into_inner().into_iter().map(|group| {
@@ -324,7 +328,6 @@ fn main() {
 					&groups_final,
 					&fd_semaphore,
 					&completion_count,
-					inodes_final_count,
 					(SMALL_READ_SIZE + 1)..u64::MAX,
 				)
 			}),
@@ -347,7 +350,18 @@ fn main() {
 	);
 }
 
-fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
+fn print_progress(cur: &Cell<usize>, total: usize) {
+	let cur = cur.get();
+	let integer_part = cur * 100 / total;
+	let frac_part = cur * 10000 / total - integer_part * 100;
+
+	eprint!(
+		"{}",
+		format!("\r[{cur}/{total}] ({integer_part:.2}.{frac_part:.2}%)")
+	);
+}
+
+fn block_on<F: Future>(ring: &RefCell<Uring>, pre_block: &dyn Fn(), mut fut: F) -> F::Output {
 	loop {
 		if let Poll::Ready(x) = Future::poll(
 			unsafe { Pin::new_unchecked(&mut fut) },
@@ -360,6 +374,7 @@ fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
 		let in_flight = borrowed_ring.in_flight();
 
 		if borrowed_ring.sq_enqueued() != 0 || in_flight != 0 {
+			pre_block();
 			borrowed_ring.submit(in_flight / 8 + 1);
 		}
 	}

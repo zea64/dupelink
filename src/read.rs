@@ -23,7 +23,6 @@ pub async fn hash_group(
 	new_groups: &RefCell<Vec<FileGroup>>,
 	fd_semaphore: &Semaphore,
 	completion_count: &Cell<usize>,
-	total_count: usize,
 	range: Range<u64>,
 ) {
 	if group.info.size < range.start {
@@ -31,8 +30,7 @@ pub async fn hash_group(
 		return;
 	}
 
-	let mut files: Vec<_> =
-		group
+	let mut files: Vec<_> = group
 		.files
 		.iter_mut()
 		.map(|file| {
@@ -42,11 +40,6 @@ pub async fn hash_group(
 
 				let new_completion_count = completion_count.get() + 1;
 				completion_count.set(new_completion_count);
-
-				let integer_part = new_completion_count * 100 / total_count;
-				let frac_part = new_completion_count * 10000 / total_count - integer_part * 100;
-
-				eprint!("{}", format!("\r[{new_completion_count}/{total_count}] ({integer_part:.2}.{frac_part:.2}%)"));
 
 				let fd = match Openat2::new(
 					&globals.ring,
@@ -75,16 +68,16 @@ pub async fn hash_group(
 				.link();
 
 				let mut buffer: Box<[u8]> =
-				vec![0; cmp::min(target_size.try_into().unwrap(), 2 * 1024 * 1024,)].into();
+					vec![0; cmp::min(target_size.try_into().unwrap(), 2 * 1024 * 1024,)].into();
 
 				let mut hash = std::hash::DefaultHasher::new();
 				let mut total_read: u64 = 0;
 				loop {
 					let to_read =
-					cmp::min((target_size - total_read).try_into().unwrap(), buffer.len());
+						cmp::min((target_size - total_read).try_into().unwrap(), buffer.len());
 					let read =
-					Read::new(&globals.ring, fd.as_fd(), u64::MAX, &mut buffer[0..to_read])
-					.await;
+						Read::new(&globals.ring, fd.as_fd(), u64::MAX, &mut buffer[0..to_read])
+							.await;
 
 					match read {
 						Ok(0) => {
