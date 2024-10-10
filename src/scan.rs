@@ -10,7 +10,7 @@ use core::{
 use std::{collections::HashMap, ffi::CString, hash::DefaultHasher, time::SystemTime};
 
 use rustix::{
-	fd::{AsFd, BorrowedFd, OwnedFd},
+	fd::{AsRawFd, BorrowedFd, OwnedFd},
 	fs::{openat2, AtFlags, Dir, FileType, Mode, Statx as StatxStruct, StatxFlags},
 	io::Errno,
 };
@@ -34,23 +34,26 @@ pub fn recurse_dir(
 	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
 	scanned_files: &Cell<usize>,
 ) {
-	let dir_iter = Dir::read_from(dirfd.as_fd()).unwrap();
+	// # SAFETY
+	// We only use this as dfd in openat while dir_iter is still alive.
+	let borrowed_dir = unsafe { BorrowedFd::borrow_raw(dirfd.as_raw_fd()) };
+	let dir = Dir::new(dirfd).unwrap();
+	let mut dir_iter = dir.skip(2);
 
 	let mut files = Vec::new();
 	let mut dirs = Vec::new();
 
-	for dentry in dir_iter.skip(2) {
+	for dentry in &mut dir_iter {
 		let dentry = dentry.unwrap();
 
 		match dentry.file_type() {
 			FileType::RegularFile => {
 				let file_name = dentry.file_name().to_owned();
-				let dirfd_borrow: BorrowedFd<'_> = dirfd.as_fd();
 				files.push(FutureOrOutput::Future(async move {
 					let mut statx_buf = unsafe { MaybeUninit::zeroed().assume_init() };
 					let ret = Statx::new(
 						&globals.ring,
-						dirfd_borrow,
+						borrowed_dir,
 						&file_name,
 						AtFlags::empty(),
 						globals.statx_flags,
@@ -99,7 +102,7 @@ pub fn recurse_dir(
 		let path = path_concat(&mut path_buf, dir_path, &new_dir_path);
 
 		match openat2(
-			dirfd.as_fd(),
+			borrowed_dir,
 			&new_dir_path,
 			globals.dir_oflags,
 			Mode::empty(),
