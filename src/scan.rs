@@ -8,7 +8,14 @@ use rustix::{
 };
 use uring_async::ops::Statx;
 
-use crate::{block_on, FileInfo, FutureOrOutput, Globals, GroupInfo, Path, SliceJoin};
+use crate::{
+	block_on,
+	future::{FutureOrOutput, SliceJoin},
+	FileInfo,
+	Globals,
+	GroupInfo,
+	Path,
+};
 
 pub fn recurse_dir(
 	globals: &Globals,
@@ -61,7 +68,7 @@ pub fn recurse_dir(
 	block_on(
 		&globals.ring,
 		&|| eprint!("{}", format!("Scanning {}...\r", scanned_files.get())),
-		SliceJoin(&mut files),
+		SliceJoin::new(&mut files),
 	);
 
 	for output in files {

@@ -1,6 +1,7 @@
 #![feature(new_uninit, slice_split_once, noop_waker)]
 #![allow(clippy::format_in_format_args)]
 
+mod future;
 mod link;
 mod read;
 mod scan;
@@ -10,23 +11,19 @@ use core::{
 	cmp,
 	ffi::CStr,
 	fmt,
-	future::Future,
 	hash::Hash,
-	iter::Fuse,
 	mem,
 	num::ParseIntError,
-	pin::Pin,
-	task::Waker,
 };
 use std::{
 	collections::HashMap,
 	ffi::CString,
 	os::unix::ffi::OsStringExt,
 	rc::Rc,
-	task::{Context, Poll},
 	time::SystemTime,
 };
 
+use future::{block_on, IteratorJoin};
 use rustix::{
 	fs::{self, openat2, AtFlags, Mode, OFlags, ResolveFlags, StatxFlags, CWD},
 	io::Errno,
@@ -372,116 +369,6 @@ fn print_progress(cur: &Cell<usize>, total: usize) {
 		"{}",
 		format!("\r[{cur}/{total}] ({integer_part:.2}.{frac_part:.2}%)")
 	);
-}
-
-fn block_on<F: Future>(ring: &RefCell<Uring>, pre_block: &dyn Fn(), mut fut: F) -> F::Output {
-	loop {
-		if let Poll::Ready(x) = Future::poll(
-			unsafe { Pin::new_unchecked(&mut fut) },
-			&mut Context::from_waker(Waker::noop()),
-		) {
-			break x;
-		}
-
-		let mut borrowed_ring = ring.borrow_mut();
-		let in_flight = borrowed_ring.in_flight();
-
-		if borrowed_ring.sq_enqueued() != 0 || in_flight != 0 {
-			pre_block();
-			borrowed_ring.submit(in_flight / 8 + 1);
-		}
-	}
-}
-
-enum FutureOrOutput<F, O> {
-	Future(F),
-	Output(O),
-}
-
-impl<F, O> FutureOrOutput<F, O> {
-	fn unwrap_output(self) -> O {
-		match self {
-			FutureOrOutput::Output(x) => x,
-			_ => unreachable!(),
-		}
-	}
-}
-
-struct SliceJoin<'a, F: Future>(&'a mut [FutureOrOutput<F, <F as Future>::Output>]);
-
-impl<'a, F: Future> Future for SliceJoin<'a, F> {
-	type Output = ();
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = Pin::into_inner(self);
-		let mut output_count = 0;
-		for fut_or_output in this.0.iter_mut() {
-			match fut_or_output {
-				FutureOrOutput::Output(_) => {
-					output_count += 1;
-				}
-				FutureOrOutput::Future(f) => {
-					if let Poll::Ready(output) = Future::poll(unsafe { Pin::new_unchecked(f) }, cx)
-					{
-						*fut_or_output = FutureOrOutput::Output(output);
-						output_count += 1;
-					}
-				}
-			}
-		}
-
-		if output_count == this.0.len() {
-			Poll::Ready(())
-		} else {
-			Poll::Pending
-		}
-	}
-}
-
-struct IteratorJoin<F: Future<Output = ()>, I: Iterator<Item = F>> {
-	buffer: Vec<Option<F>>,
-	iter: Fuse<I>,
-}
-
-impl<F: Future<Output = ()>, I: Iterator<Item = F>> IteratorJoin<F, I> {
-	fn new(n: usize, iter: I) -> Self {
-		Self {
-			buffer: (0..n).map(|_| None).collect(),
-			iter: iter.fuse(),
-		}
-	}
-}
-
-impl<F: Future<Output = ()>, I: Iterator<Item = F>> Future for IteratorJoin<F, I> {
-	type Output = ();
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = unsafe { Pin::into_inner_unchecked(self) };
-
-		let mut any_pending = false;
-		for slot in this.buffer.iter_mut() {
-			loop {
-				if let Some(f) = slot {
-					if Future::poll(unsafe { Pin::new_unchecked(f) }, cx).is_ready() {
-						*slot = None;
-					} else {
-						any_pending = true;
-						break;
-					}
-				} else if let Some(f) = this.iter.next() {
-					*slot = Some(f);
-				} else {
-					break;
-				}
-			}
-		}
-
-		if any_pending {
-			Poll::Pending
-		} else {
-			Poll::Ready(())
-		}
-	}
 }
 
 #[derive(Debug, Clone)]

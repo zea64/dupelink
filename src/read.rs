@@ -16,7 +16,11 @@ use uring_async::{
 	sync::Semaphore,
 };
 
-use crate::{FileGroup, FutureOrOutput, Globals, SliceJoin};
+use crate::{
+	future::{FutureOrOutput, SliceJoin},
+	FileGroup,
+	Globals,
+};
 
 pub async fn hash_group(
 	globals: &Globals,
@@ -122,7 +126,7 @@ pub async fn hash_group(
 		})
 		.collect();
 
-	SliceJoin(&mut files).await;
+	SliceJoin::new(&mut files).await;
 	drop(files);
 
 	group.files.sort_unstable();
