@@ -1,13 +1,5 @@
-use core::{
-	cell::Cell,
-	error::Error,
-	ffi::CStr,
-	fmt,
-	hash::Hasher,
-	mem::MaybeUninit,
-	time::Duration,
-};
-use std::{collections::HashMap, ffi::CString, hash::DefaultHasher, time::SystemTime};
+use core::{cell::Cell, error::Error, fmt, hash::Hasher, mem::MaybeUninit, time::Duration};
+use std::{collections::HashMap, hash::DefaultHasher, rc::Rc, time::SystemTime};
 
 use rustix::{
 	fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -16,21 +8,12 @@ use rustix::{
 };
 use uring_async::ops::Statx;
 
-use crate::{
-	block_on,
-	path_concat,
-	FileInfo,
-	FutureOrOutput,
-	Globals,
-	GroupInfo,
-	MegaName,
-	SliceJoin,
-};
+use crate::{block_on, FileInfo, FutureOrOutput, Globals, GroupInfo, Path, SliceJoin};
 
 pub fn recurse_dir(
 	globals: &Globals,
 	dirfd: OwnedFd,
-	dir_path: &CStr,
+	dir_path: Rc<Path>,
 	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
 	scanned_files: &Cell<usize>,
 ) {
@@ -91,16 +74,18 @@ pub fn recurse_dir(
 			}
 		};
 
-		if let Err(err) = record_stat(globals, map, statx, dir_path, &file_path) {
+		if let Err(err) = record_stat(
+			globals,
+			map,
+			statx,
+			Path::extend(&dir_path, file_path.as_c_str()),
+		) {
 			eprintln!("Error statting {:?}: {}", file_path, err)
 		}
 	}
 
-	let mut path_buf = Vec::new();
-
 	for new_dir_path in dirs {
-		let path = path_concat(&mut path_buf, dir_path, &new_dir_path);
-
+		let path = Path::extend(&dir_path, new_dir_path.as_c_str());
 		match openat2(
 			borrowed_dir,
 			&new_dir_path,
@@ -108,10 +93,10 @@ pub fn recurse_dir(
 			Mode::empty(),
 			globals.dir_open_how.resolve,
 		) {
-			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, path, map, scanned_files),
+			Ok(new_dirfd) => recurse_dir(globals, new_dirfd, Rc::new(path), map, scanned_files),
 			Err(Errno::XDEV) => (),
 			Err(err) => {
-				eprintln!("Error opening {:?}: {}", path, err);
+				eprintln!("Error opening {}: {}", path, err);
 				continue;
 			}
 		}
@@ -146,8 +131,7 @@ pub fn record_stat(
 	globals: &Globals,
 	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
 	statx: StatxStruct,
-	dir_path: &CStr,
-	file_path: &CStr,
+	path: Path,
 ) -> Result<(), RecordStatError> {
 	let set_flags = StatxFlags::from_bits_truncate(statx.stx_mask);
 	if !set_flags.contains(globals.statx_flags) {
@@ -172,16 +156,13 @@ pub fn record_stat(
 		hashed: hasher.finish(),
 	};
 
-	let mut path_buf = Vec::new();
-	path_concat(&mut path_buf, dir_path, file_path);
-	let full_path = CString::from_vec_with_nul(path_buf.clone()).unwrap();
 	let file_info = FileInfo {
 		ino: statx.stx_ino,
 		hash: 0,
 		ctime: SystemTime::UNIX_EPOCH
 			+ Duration::from_secs(statx.stx_ctime.tv_sec.try_into().unwrap())
 			+ Duration::from_nanos(statx.stx_ctime.tv_nsec.into()),
-		path: MegaName::from_cstring(full_path),
+		path: vec![path],
 	};
 
 	map.entry(group_info).or_default().push(file_info);

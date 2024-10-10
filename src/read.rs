@@ -1,6 +1,7 @@
 use core::{
 	cell::{Cell, RefCell},
 	cmp,
+	ffi::CStr,
 	hash::Hasher,
 	ops::Range,
 };
@@ -41,10 +42,14 @@ pub async fn hash_group(
 				let new_completion_count = completion_count.get() + 1;
 				completion_count.set(new_completion_count);
 
+				let mut path_buf = Vec::new();
+				file.path[0].flatten(&mut path_buf);
+				path_buf.push(0);
+
 				let fd = match Openat2::new(
 					&globals.ring,
 					CWD,
-					file.path.first_name(),
+					CStr::from_bytes_until_nul(&path_buf).unwrap(),
 					&globals.file_open_how,
 				)
 				.await
@@ -52,7 +57,7 @@ pub async fn hash_group(
 					Ok(fd) => fd,
 					Err(err) => {
 						file.ino = 0;
-						eprintln!("Error opening {:?}: {}", file.path.first_name(), err);
+						eprintln!("Error opening {}: {}", file.path[0], err);
 						return;
 					}
 				};
@@ -92,7 +97,7 @@ pub async fn hash_group(
 						Err(Errno::AGAIN | Errno::INTR | Errno::CANCELED) => (),
 						Err(err) => {
 							file.ino = 0;
-							eprintln!("Error reading {:?}: {}", file.path.first_name(), err);
+							eprintln!("Error reading {}: {}", file.path[0], err);
 							return;
 						}
 					}

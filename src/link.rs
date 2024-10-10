@@ -1,10 +1,11 @@
 use core::{ffi::CStr, fmt::Write};
+use std::ffi::CString;
 
 use rustix::fs::{linkat, renameat_with, unlink, AtFlags, RenameFlags, CWD};
 
-use crate::{FileGroup, Globals, LinkMethod};
+use crate::{FileGroup, Globals, LinkMethod, Path};
 
-const TMP_FILE_NAME: &[u8] = b"DUPELINK_TMP_FILE";
+const TMP_FILE_NAME: &CStr = c"DUPELINK_TMP_FILE";
 
 pub fn link(
 	globals: &Globals,
@@ -42,27 +43,32 @@ pub fn link(
 
 fn hardlink(write_buffer: &mut impl Write, group: FileGroup, link: bool) {
 	let mut names = group.files.iter().flat_map(|file| file.path.iter());
-	let master_name = names.next().unwrap();
+	let master_name = {
+		let mut buf = Vec::new();
+		names.next().unwrap().flatten(&mut buf);
+		CString::from_vec_with_nul(buf).unwrap()
+	};
 
-	let mut path_buf = Vec::new();
+	let mut tmp_path_buf = Vec::new();
+	let mut orig_path_buf = Vec::new();
 
 	writeln!(write_buffer, "{:?}", master_name).unwrap();
 
-	for name in names {
+	for path in names {
 		// TODO, check that file hasn't changed.
+
+		let name = path.flatten(&mut orig_path_buf);
+
 		if link {
-			name.to_bytes()
-				.rsplit_once(|c| *c == b'/')
-				.unwrap()
-				.0
-				.clone_into(&mut path_buf);
-			path_buf.push(b'/');
-			path_buf.extend_from_slice(TMP_FILE_NAME);
-			path_buf.push(0);
+			let tmp_path = path
+				.prefix
+				.as_ref()
+				.map(|x| Path::extend(x, TMP_FILE_NAME))
+				.unwrap_or_else(|| Path::new(TMP_FILE_NAME));
 
-			let tmp_name = CStr::from_bytes_with_nul(&path_buf).unwrap();
+			let tmp_name = tmp_path.flatten(&mut tmp_path_buf);
 
-			if let Err(err) = linkat(CWD, master_name, CWD, tmp_name, AtFlags::empty()) {
+			if let Err(err) = linkat(CWD, &master_name, CWD, tmp_name, AtFlags::empty()) {
 				eprintln!("Error linking {:?} to {:?}: {}", master_name, tmp_name, err);
 				continue;
 			}

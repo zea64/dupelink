@@ -13,6 +13,7 @@ use core::{
 	future::Future,
 	hash::Hash,
 	iter::Fuse,
+	mem,
 	num::ParseIntError,
 	pin::Pin,
 	task::Waker,
@@ -21,6 +22,7 @@ use std::{
 	collections::HashMap,
 	ffi::CString,
 	os::unix::ffi::OsStringExt,
+	rc::Rc,
 	task::{Context, Poll},
 	time::SystemTime,
 };
@@ -37,7 +39,7 @@ struct FileInfo {
 	ino: u64,
 	hash: u64,
 	ctime: SystemTime,
-	path: MegaName,
+	path: Vec<Path>,
 }
 
 impl PartialEq for FileInfo {
@@ -229,12 +231,20 @@ fn main() {
 			ResolveFlags::empty(),
 		) {
 			Ok(dir) => {
-				scan::recurse_dir(&globals, dir, path, &mut map, &Cell::new(0));
+				scan::recurse_dir(
+					&globals,
+					dir,
+					Rc::new(Path::new(path)),
+					&mut map,
+					&Cell::new(0),
+				);
 			}
 			Err(Errno::NOTDIR) => {
 				match fs::statx(CWD, path, AtFlags::empty(), globals.statx_flags) {
 					Ok(stat) => {
-						if let Err(err) = scan::record_stat(&globals, &mut map, stat, c".", path) {
+						if let Err(err) =
+							scan::record_stat(&globals, &mut map, stat, Path::new(path))
+						{
 							eprintln!("Error statting {:?}: {}", path, err);
 						}
 					}
@@ -266,7 +276,10 @@ fn main() {
 						ino: infos[0].ino,
 						hash: infos[0].hash,
 						ctime: infos[0].ctime,
-						path: infos.iter().map(|x| x.path.first_name()).into(),
+						path: infos
+							.iter_mut()
+							.flat_map(|x| mem::take(&mut x.path))
+							.collect(),
 					})
 					.collect();
 
@@ -471,61 +484,53 @@ impl<F: Future<Output = ()>, I: Iterator<Item = F>> Future for IteratorJoin<F, I
 	}
 }
 
-#[derive(Clone)]
-struct MegaName(Box<[u8]>);
-
-impl<'a> MegaName {
-	fn from_cstring(cstring: CString) -> Self {
-		Self(cstring.into_bytes_with_nul().into())
-	}
-
-	fn first_name(&self) -> &CStr {
-		unsafe { CStr::from_ptr(self.0.as_ptr().cast()) }
-	}
-
-	fn iter(&'a self) -> MegaNameIter<'a> {
-		MegaNameIter(&self.0)
-	}
+#[derive(Debug, Clone)]
+struct Path {
+	suffix: Box<[u8]>,
+	prefix: Option<Rc<Path>>,
 }
 
-impl<'a, T: Iterator<Item = &'a CStr>> From<T> for MegaName {
-	fn from(value: T) -> Self {
-		Self(value.flat_map(CStr::to_bytes_with_nul).copied().collect())
-	}
-}
-
-impl fmt::Debug for MegaName {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_list().entries(self.iter()).finish()
-	}
-}
-
-#[derive(Debug)]
-struct MegaNameIter<'a>(&'a [u8]);
-
-impl<'a> Iterator for MegaNameIter<'a> {
-	type Item = &'a CStr;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.0.is_empty() {
-			None
-		} else {
-			let ret = unsafe { CStr::from_ptr(self.0.as_ptr().cast()) };
-			let next_index = self.0.iter().position(|x| *x == 0).unwrap() + 1;
-			self.0 = &self.0[next_index..];
-			Some(ret)
+impl<'a> Path {
+	fn new(suffix: &CStr) -> Self {
+		Path {
+			suffix: suffix.to_bytes().to_owned().into(),
+			prefix: None,
 		}
 	}
+
+	fn extend(self: &Rc<Self>, suffix: &CStr) -> Self {
+		Path {
+			suffix: suffix.to_bytes().to_owned().into(),
+			prefix: Some(self.clone()),
+		}
+	}
+
+	fn flatten(&self, buf: &'a mut Vec<u8>) -> &'a CStr {
+		buf.clear();
+
+		fn inner(s: &Path, buf: &mut Vec<u8>) {
+			if let Some(ref s) = s.prefix {
+				inner(s, buf);
+				buf.push(b'/');
+			}
+			buf.extend_from_slice(&s.suffix);
+		}
+
+		inner(self, buf);
+		buf.push(0);
+
+		CStr::from_bytes_until_nul(buf).unwrap()
+	}
 }
 
-fn path_concat<'a, 'b>(path_buf: &'a mut Vec<u8>, str1: &'b CStr, str2: &'b CStr) -> &'a CStr {
-	path_buf.clear();
-	path_buf.extend_from_slice(str1.to_bytes());
-	path_buf.push(b'/');
-	path_buf.extend_from_slice(str2.to_bytes());
-	path_buf.push(0);
+impl fmt::Display for Path {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if let Some(ref prefix) = self.prefix {
+			write!(f, "{}/", prefix)?;
+		}
 
-	CStr::from_bytes_with_nul(path_buf).unwrap()
+		write!(f, "{}", core::str::from_utf8(&self.suffix).unwrap_or("?"))
+	}
 }
 
 fn parse_size(mut s: &str) -> Result<u64, ParseIntError> {
