@@ -1,4 +1,4 @@
-#![feature(new_uninit, slice_split_once, noop_waker)]
+#![feature(slice_split_once, noop_waker)]
 #![allow(clippy::format_in_format_args)]
 
 mod future;

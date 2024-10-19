@@ -49,7 +49,7 @@ impl<'a, F: Future> SliceJoin<'a, F> {
 	}
 }
 
-impl<'a, F: Future> Future for SliceJoin<'a, F> {
+impl<F: Future> Future for SliceJoin<'_, F> {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
