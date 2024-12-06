@@ -90,8 +90,15 @@ pub async fn hash_group(
 
 					match read {
 						Ok(0) => {
-							assert_eq!(total_read, target_size);
-							break;
+							if total_read == target_size {
+								break;
+							} else {
+								eprintln!(
+									"File size changed {}: {} -> {}",
+									file.path[0], target_size, total_read
+								);
+								return;
+							}
 						}
 						Ok(x) => {
 							total_read += <u32 as Into<u64>>::into(x);
