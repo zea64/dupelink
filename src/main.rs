@@ -79,6 +79,8 @@ struct FileGroup {
 	files: Vec<FileInfo>,
 }
 
+type FileMap = HashMap<GroupInfo, Vec<FileInfo>>;
+
 #[derive(Debug)]
 struct Args {
 	minsize: u64,

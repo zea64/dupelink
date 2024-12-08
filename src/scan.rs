@@ -1,5 +1,5 @@
 use core::{cell::Cell, error::Error, fmt, hash::Hasher, mem::MaybeUninit, time::Duration};
-use std::{collections::HashMap, hash::DefaultHasher, rc::Rc, time::SystemTime};
+use std::{hash::DefaultHasher, rc::Rc, time::SystemTime};
 
 use rustix::{
 	fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -12,6 +12,7 @@ use crate::{
 	block_on,
 	future::{FutureOrOutput, SliceJoin},
 	FileInfo,
+	FileMap,
 	Globals,
 	GroupInfo,
 	Path,
@@ -21,7 +22,7 @@ pub fn recurse_dir(
 	globals: &Globals,
 	dirfd: OwnedFd,
 	dir_path: Rc<Path>,
-	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
+	map: &mut FileMap,
 	scanned_files: &Cell<usize>,
 ) {
 	// # SAFETY
@@ -136,7 +137,7 @@ impl fmt::Display for RecordStatError {
 
 pub fn record_stat(
 	globals: &Globals,
-	map: &mut HashMap<GroupInfo, Vec<FileInfo>>,
+	map: &mut FileMap,
 	statx: StatxStruct,
 	path: Path,
 ) -> Result<(), RecordStatError> {
