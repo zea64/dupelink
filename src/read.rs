@@ -40,6 +40,8 @@ pub async fn hash_group(
 		.iter_mut()
 		.map(|file| {
 			FutureOrOutput::Future(async move {
+				const READ_CHUNK: usize = 2 * 1024 * 1024;
+
 				let _guard = fd_semaphore.wait().await;
 				let target_size = cmp::min(group.info.size, range.end);
 
@@ -67,17 +69,24 @@ pub async fn hash_group(
 				};
 
 				// This will add it to the sq but *not* submit. We want to submit *with* the next read. Cleanup will happen later.
-				let fadvise = Fadvise::new(
-					&globals.ring,
-					fd.as_fd(),
-					range.start,
-					(range.end - range.start).try_into().unwrap_or(u32::MAX),
-					Advice::WillNeed,
-				)
-				.link();
+				// Don't bother doing this if we're gonna immediately read the whole thing.
+				let fadvise = if range.end - range.start > READ_CHUNK as u64 {
+					Some(
+						Fadvise::new(
+							&globals.ring,
+							fd.as_fd(),
+							range.start,
+							(range.end - range.start).try_into().unwrap_or(u32::MAX),
+							Advice::WillNeed,
+						)
+						.link(),
+					)
+				} else {
+					None
+				};
 
 				let mut buffer: Box<[u8]> =
-					vec![0; cmp::min(target_size.try_into().unwrap(), 2 * 1024 * 1024,)].into();
+					vec![0; cmp::min(target_size.try_into().unwrap(), READ_CHUNK,)].into();
 
 				let mut hash = std::hash::DefaultHasher::new();
 				let mut total_read: u64 = 0;
@@ -115,7 +124,9 @@ pub async fn hash_group(
 				}
 
 				// Cleanup fadvise from earlier (it doesn't have a good drop impl yet).
-				let _ = fadvise.await;
+				if let Some(f) = fadvise {
+					let _ = f.await;
+				}
 
 				let _ = Fadvise::new(
 					&globals.ring,
