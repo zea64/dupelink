@@ -70,7 +70,7 @@ pub async fn hash_group(
 
 				// This will add it to the sq but *not* submit. We want to submit *with* the next read. Cleanup will happen later.
 				// Don't bother doing this if we're gonna immediately read the whole thing.
-				let fadvise = if range.end - range.start > READ_CHUNK as u64 {
+				let fadvise1 = if range.end - range.start > READ_CHUNK as u64 {
 					Some(
 						Fadvise::new(
 							&globals.ring,
@@ -80,6 +80,14 @@ pub async fn hash_group(
 							Advice::WillNeed,
 						)
 						.link(),
+					)
+				} else {
+					None
+				};
+				let fadvise2 = if range.end < group.info.size {
+					Some(
+						Fadvise::new(&globals.ring, fd.as_fd(), range.end, 0, Advice::DontNeed)
+							.link(),
 					)
 				} else {
 					None
@@ -123,8 +131,11 @@ pub async fn hash_group(
 					}
 				}
 
-				// Cleanup fadvise from earlier (it doesn't have a good drop impl yet).
-				if let Some(f) = fadvise {
+				// Cleanup fadvises from earlier (it doesn't have a good drop impl yet).
+				if let Some(f) = fadvise1 {
+					let _ = f.await;
+				}
+				if let Some(f) = fadvise2 {
 					let _ = f.await;
 				}
 
