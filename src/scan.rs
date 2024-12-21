@@ -31,38 +31,39 @@ pub fn recurse_dir(
 	let dir = Dir::new(dirfd).unwrap();
 	let mut dir_iter = dir.skip(2);
 
-	let mut files = Vec::new();
-	let mut dirs = Vec::new();
+	let mut file_names = Vec::new();
+	let mut dir_names = Vec::new();
 
 	for dentry in &mut dir_iter {
 		let dentry = dentry.unwrap();
+		let name = dentry.file_name().to_owned();
 
 		match dentry.file_type() {
-			FileType::RegularFile => {
-				let file_name = dentry.file_name().to_owned();
-				files.push(FutureOrOutput::Future(async move {
-					let mut statx_buf = unsafe { MaybeUninit::zeroed().assume_init() };
-					let ret = Statx::new(
-						&globals.ring,
-						borrowed_dir,
-						&file_name,
-						AtFlags::empty(),
-						globals.statx_flags,
-						&mut statx_buf,
-					)
-					.await;
-
-					(ret.map(|_| statx_buf), file_name)
-				}));
-			}
-			FileType::Directory => {
-				dirs.push(dentry.file_name().to_owned());
-			}
+			FileType::RegularFile => file_names.push(name),
+			FileType::Directory => dir_names.push(name),
 			_ => (),
 		}
 	}
 
-	dirs.shrink_to_fit();
+	file_names.sort_unstable();
+	let mut files: Vec<_> = file_names
+		.into_iter()
+		.map(|name| {
+			FutureOrOutput::Future(async move {
+				let mut statx_buf = unsafe { MaybeUninit::zeroed().assume_init() };
+				let ret = Statx::new(
+					&globals.ring,
+					borrowed_dir,
+					&name,
+					AtFlags::empty(),
+					globals.statx_flags,
+					&mut statx_buf,
+				)
+				.await;
+				(ret.map(|_| statx_buf), name)
+			})
+		})
+		.collect();
 
 	scanned_files.set(scanned_files.get() + files.len());
 
@@ -82,18 +83,16 @@ pub fn recurse_dir(
 			}
 		};
 
-		if let Err(err) = record_stat(
-			globals,
-			map,
-			statx,
-			Path::extend(&dir_path, file_path.as_c_str()),
-		) {
+		if let Err(err) = record_stat(globals, map, statx, Path::extend(&dir_path, &file_path)) {
 			eprintln!("Error statting {:?}: {}", file_path, err)
 		}
 	}
 
-	for new_dir_path in dirs {
-		let path = Path::extend(&dir_path, new_dir_path.as_c_str());
+	dir_names.sort_unstable();
+	dir_names.shrink_to_fit();
+
+	for new_dir_path in dir_names {
+		let path = Path::extend(&dir_path, &new_dir_path);
 		match openat2(
 			borrowed_dir,
 			&new_dir_path,
